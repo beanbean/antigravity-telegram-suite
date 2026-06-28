@@ -138,6 +138,8 @@ if (ALLOWED_CHAT_IDS.length === 0) {
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 900000 }); // 15 minutes timeout to allow long /ask requests
 
 startCronJobs(bot); // Khởi chạy finance cron jobs
+const { startBrain2Cron } = require('./brain2-cron');
+startBrain2Cron(bot); // Brain2 autonomous cron (03h/06h/09h/20h)
 
 // --- FINANCE BOT COMMANDS ---
 bot.command('tuvan', async (ctx) => {
@@ -689,6 +691,14 @@ bot.command('close_window', async (ctx) => {
 });
 
 const handleStatus = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        let msg = '📊 <b>Claude Code (CLI) Status</b>\n\n';
+        msg += `🤖 Model: <b>${typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : 'Default'}</b>\n`;
+        msg += `📁 Workspace: <code>${CLAUDE_WORK_DIR}</code>\n`;
+        const { isSessionActive } = require('./claude-controller');
+        msg += `⏳ Active Task: ${isSessionActive(String(ctx.chat.id)) ? 'Yes' : 'No'}\n`;
+        return ctx.reply(msg, { parse_mode: 'HTML' });
+    }
     let msg = t('status.report_title');
     
     const agentCheck = await isIDERunning('agent');
@@ -818,16 +828,15 @@ async function buildMainMenu(overrideThread = null, overrideWorkspace = null, ta
     if (displayTitle.length > 20) displayTitle = displayTitle.substring(0, 18) + '...';
 
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        const cwDir = process.env.CLAUDE_WORK_DIR || process.env.HOME;
+        let cwName = require('path').basename(cwDir);
+        if (cwName.length > 20) cwName = cwName.substring(0, 18) + '...';
         return Markup.keyboard([
-            ['📋 Session', '🧠 Model', '🔀 Engine'],
-            [
-                t('menu.btn_screenshot') || '📸 Screen', 
-                t('menu.btn_artifacts') || '📦 Artifacts',
-                t('btn_skills') || '🛠️ Skills'
-            ],
+            [`📁 ${cwName}`, '🧠 Model'],
+            ['📋 Session', '🔀 Engine'],
             [
                 isTurboMode ? (t('turbo.btn_on') || '🚀 Turbo ✅') : (t('turbo.btn_off') || '🚀 Turbo'), 
-                t('menu.btn_latest') || '💬 Latest'
+                t('btn_skills') || '🛠️ Skills'
             ]
         ]).resize();
     }
@@ -882,6 +891,9 @@ bot.command('start', async (ctx) => {
 });
 
 const handleLatest = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     try {
         // Use the preferred target (set by workspace switch or /window command)
         // instead of blindly picking candidates[0] which may be the wrong window
@@ -901,6 +913,9 @@ bot.command('latest', handleLatest);
 bot.hears(/^💬/i, handleLatest);
 
 const handleScreenshot = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     try {
         setReaction(ctx, REACTION.THINKING);
         const buffer = await captureFullIDEScreenshot(CDP_PORT);
@@ -1028,18 +1043,18 @@ const handleEngine = async (ctx) => {
 bot.command('engine', handleEngine);
 bot.hears(/^🔀/i, handleEngine);
 
-bot.action('engine_antigravity', (ctx) => {
+bot.action('engine_antigravity', async (ctx) => {
     currentEngine = 'antigravity';
     saveEngine('antigravity');
     ctx.answerCbQuery('Switched to Antigravity');
-    ctx.editMessageText('🔀 Engine: <b>Antigravity (CDP)</b> ✅', { parse_mode: 'HTML' }).catch(() => {});
+    await sendMainMenu(ctx, '🔀 Engine: <b>Antigravity (CDP)</b> ✅');
 });
 
-bot.action('engine_claude', (ctx) => {
+bot.action('engine_claude', async (ctx) => {
     currentEngine = 'claude';
     saveEngine('claude');
     ctx.answerCbQuery('Switched to Claude Code');
-    ctx.editMessageText('🔀 Engine: <b>Claude Code (CLI)</b> ✅', { parse_mode: 'HTML' }).catch(() => {});
+    await sendMainMenu(ctx, '🔀 Engine: <b>Claude Code (CLI)</b> ✅');
 });
 
 // ===== CLAUDE CODE QUERY HANDLER =====
@@ -1115,6 +1130,7 @@ async function handleClaudeQuery(ctx, query) {
 
 // ===== CLAUDE SESSION PICKER =====
 const handleSession = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'antigravity') return;
     if (currentEngine !== 'claude') {
         return ctx.reply('ℹ️ Session chỉ dùng cho Claude Code engine.\nDùng /engine để chuyển.');
     }
@@ -1431,6 +1447,9 @@ function getAvailableSkills() {
 }
 
 async function handleListSkills(ctx, pageIndex = 0) {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     const skills = getAvailableSkills();
     if (skills.length === 0) {
         return ctx.reply(t('skills.empty') || 'No skills found.');
@@ -1576,6 +1595,9 @@ bot.command('new', async (ctx) => {
 });
 
 bot.command('agents', async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     const parts = ctx.message.text.split(' ');
     const num = parseInt(parts[1], 10);
     
@@ -1660,6 +1682,9 @@ bot.hears(/^\/agents_(\d+)$/, async (ctx) => {
 });
 
 const handleArtifacts = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     try {
         const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
         const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
@@ -1891,14 +1916,16 @@ const handleModel = async (ctx) => {
         }
 
         const models = [
-            'opus',
-            'sonnet',
-            'haiku'
+            { label: '⚡ claude-haiku-4-5 (nhanh, rẻ)', value: 'haiku' },
+            { label: '🧠 claude-sonnet-4-6 (cân bằng)', value: 'sonnet' },
+            { label: '🔥 claude-opus-4-8 (mạnh nhất)', value: 'opus' },
+            { label: '🧠 claude-sonnet-4-6 (full ID)', value: 'claude-sonnet-4-6' },
+            { label: '🔥 claude-opus-4-8 (full ID)', value: 'claude-opus-4-8' },
         ];
 
         const buttons = models.map(m => {
-            const cbData = 'cmd_' + Buffer.from(m).toString('base64').slice(0, 58);
-            return [{ text: `🤖 ${m}`, callback_data: cbData }];
+            const cbData = 'cmd_' + Buffer.from(m.value).toString('base64').slice(0, 58);
+            return [{ text: `${m.label}${currentClaudeModel === m.value ? ' ✅' : ''}`, callback_data: cbData }];
         });
         
         ctx.reply('🧠 <b>Chọn Model cho Claude Code:</b>\nHoặc gõ <code>/model [tên_model]</code> để đổi sang model khác.', {
@@ -1992,6 +2019,9 @@ bot.action(/^cmd_(.+)/, async (ctx) => {
 // ===== AUTO-ACCEPT =====
 
 const handleAutoAccept = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     const text = ctx.message.text || '';
     const parts = text.split(' ');
     parts.shift();
@@ -2305,15 +2335,35 @@ const handleWorkspace = (ctx) => {
     }
     
     currentWorkspaceDir = wsPath;
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        updateEnvFile('CLAUDE_WORK_DIR', wsPath);
+        resetSession(String(ctx.chat.id));
+        ctx.reply(`✅ Đã chuyển thư mục làm việc của Claude Code sang:\n<code>${wsPath}</code>\n\n(Session cũ đã được reset để bắt đầu trong thư mục mới)`, { parse_mode: 'HTML' });
+        sendMainMenu(ctx, `Thư mục hiện tại: <b>${path.basename(wsPath)}</b>`);
+        return;
+    }
     doLaunchWorkspace(ctx, wsPath);
 };
 bot.command('workspace', handleWorkspace);
+bot.hears(/^📁/i, handleWorkspace);
 
 bot.action(/ws_(.+)/, (ctx) => {
     const project = ctx.match[1];
     const wsPath = path.join(config.projectsDir, project);
     currentWorkspaceDir = wsPath;
     ctx.answerCbQuery(t('workspace.selected', { project }));
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        updateEnvFile('CLAUDE_WORK_DIR', wsPath);
+        resetSession(String(ctx.chat.id));
+        let msg = `✅ Đã chuyển thư mục làm việc của Claude Code sang:\n<code>${wsPath}</code>\n\n(Session cũ đã được reset để bắt đầu trong thư mục mới)`;
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            ctx.editMessageText(msg, { parse_mode: 'HTML' }).catch(()=>{});
+        } else {
+            ctx.reply(msg, { parse_mode: 'HTML' });
+        }
+        sendMainMenu(ctx, `Thư mục hiện tại: <b>${project}</b>`);
+        return;
+    }
     doLaunchWorkspace(ctx, wsPath);
 });
 
@@ -3047,6 +3097,9 @@ bot.command('update', async (ctx) => {
 // ===== TURBO / COUNCIL MODE =====
 
 async function handleTurbo(ctx) {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    }
     isTurboMode = !isTurboMode; // Toggle
     
     if (!isTurboMode) {
@@ -3082,6 +3135,7 @@ bot.command('panel', async (ctx) => {
 });
 
 bot.hears(/^🤖/i, async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') return;
     const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
     const isIDE = preferredApp === 'ide';
     
@@ -3272,6 +3326,10 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
     const skillName = ctx.match[1];
     const skillArgs = ctx.match[2] ? ctx.match[2].trim() : '';
     const query = `/${skillName} ${skillArgs}`.trim();
+    
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        return handleClaudeQuery(ctx, query).catch(() => {});
+    }
     
     let explicitTargetId = null;
     let explicitThreadName = null;

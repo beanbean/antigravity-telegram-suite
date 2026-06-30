@@ -38,13 +38,18 @@ const telegraf_1 = require("telegraf");
 const db_1 = require("./db");
 const dotenv = __importStar(require("dotenv"));
 dotenv.config({ override: true });
-const telegram = new telegraf_1.Telegram(process.env.TELEGRAM_BOT_TOKEN || '');
+// NOTE: Dùng bot instance từ main (giống Brain2Cron), không tự tạo Telegram instance.
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-function startCronJobs() {
-    if (!CHAT_ID) {
-        console.warn('⚠️ Chưa cấu hình TELEGRAM_CHAT_ID. Tính năng cảnh báo tự động sẽ bị vô hiệu hóa.');
+function startCronJobs(bot) {
+    if (!bot || !bot.telegram) {
+        console.warn('⚠️ finance/cron: bot instance chưa sẵn sàng — disabled.');
         return;
     }
+    if (!CHAT_ID) {
+        console.warn('⚠️ TELEGRAM_CHAT_ID chưa có — finance cron disabled.');
+        return;
+    }
+    const telegram = bot.telegram;
     // Hàm chạy kiểm tra
     async function checkAlerts() {
         console.log('Đang chạy kiểm tra cảnh báo tự động...');

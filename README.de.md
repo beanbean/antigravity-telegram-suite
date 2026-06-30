@@ -4,7 +4,7 @@
 
 **Funktioniert sowohl mit der [Antigravity Standalone App](https://antigravity.google/)\* als auch mit der [Antigravity IDE](https://antigravity.google/).**
 
-🌍 Sprachen: [English](README.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
+🌍 Sprachen: [English](README.md) | [中文](README.zh.md) | [한국어](README.ko.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
 
 Steuere deinen Antigravity-KI-Agenten aus der Ferne über Telegram.
 Sende Nachrichten, wechsle KI-Modelle, verwalte Arbeitsbereiche, nimm Screenshots auf und führe Multi-Agenten-Workflows aus — alles von deinem Telefon aus.
@@ -40,7 +40,7 @@ Sende Nachrichten, wechsle KI-Modelle, verwalte Arbeitsbereiche, nimm Screenshot
 | 🔔 **Proaktive Benachrichtigungen** | TaskWatcher erkennt unaufgeforderte Agenten-Nachrichten (Timer, Sub-Agents) und leitet sie an Telegram weiter |
 | 🤔 **Nachrichtenreaktionen** | Zeigt 🤔 während der Verarbeitung, löscht bei Fertigstellung |
 | 🔄 **Auto-Update** | Suche nach Updates und aktualisiere den Bot mit einem Befehl |
-| 🌐 **Mehrsprachigkeit** | 5 unterstützte Sprachen: Englisch, Türkisch, Deutsch, Spanisch, Französisch |
+| 🌐 **Mehrsprachigkeit** | 7 unterstützte Sprachen: Englisch, Chinesisch, Koreanisch, Türkisch, Deutsch, Spanisch, Französisch |
 | ⌨️ **Tipp-Indikator** | Zeigt in Telegram "tippt..." an, während der Agent arbeitet |
 | 🖥️ **Plattformübergreifend** | Funktioniert unter Linux, macOS (Intel & Apple Silicon) und Windows |
 | 🔀 **Dual-App-Unterstützung** | Nahtloser Wechsel zwischen Antigravity IDE und Standalone Agent App |
@@ -83,7 +83,7 @@ IDE_CDP_PORT=9334      # Port für die Antigravity IDE
 # Standard-KI-Modell für neue Chats
 DEFAULT_MODEL=Gemini 3.1 Pro (High)
 
-# Sprache: en | tr | de | es | fr
+# Sprache: en | zh | ko | tr | de | es | fr
 LANGUAGE=de
 
 # Bevorzugtes Anwendungsziel: 'agent' (Standalone) oder 'ide' (IDE)
@@ -269,6 +269,8 @@ antigravity-telegram-suite/
 │   └── platform.js           # Plattformübergreifende OS-Abstraktion (Starten, Schließen, Pfade)
 ├── locales/
 │   ├── en.json               # Englisch
+│   ├── zh.json               # Chinesisch (中文)
+│   ├── ko.json               # Koreanisch (한국어)
 │   ├── tr.json               # Türkisch
 │   ├── de.json               # Deutsch
 │   ├── es.json               # Spanisch
@@ -349,6 +351,8 @@ Verwende `/app`, um den Fokus des Bots zwischen den Apps zu wechseln. Die Einste
 - **[acmavirus/antigravity-telegram-control](https://github.com/acmavirus/antigravity-telegram-control)** — Die Open-Source-Telegram-Integration, die als Basis für dieses Projekt diente
 - **[yazanbaker94/AntiGravity-AutoAccept](https://github.com/yazanbaker94/AntiGravity-AutoAccept)** — Inspiration für das DOM-Observer-Muster im Auto-Accept-Modul
 - **[vassoz](https://github.com/vassoz)** — PR #12: Behebung von CDP-Verbindungen, automatische X11-Anzeigeerkennung und dynamische Port-Verknüpfungen
+- **[wade19990814-hue](https://github.com/wade19990814-hue)** — PR #14: Chinese (中文) localization
+- **[ienground](https://github.com/ienground)** — PR #17: Korean (한국어) localization
 
 ## 🌟 Credits & Inspirationen
 

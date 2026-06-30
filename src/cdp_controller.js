@@ -32,6 +32,16 @@ function _notifyThreadResolved(threadId) {
  */
 const { UI_LOCATORS_SCRIPT } = require('./ui_locators');
 
+const SUBMIT_ACTION_TEXTS = [
+    'submit', 'send', 'send message', 'gönder', 'approve', 'allow', 'confirm',
+    '提交', '发送', '发送消息', '确认', '确定'
+];
+const PENDING_ACTION_TEXTS = [
+    'run', 'accept', 'allow', 'continue', 'retry',
+    'çalıştır', 'kabul et', 'izin ver', 'devam et', 'yeniden dene',
+    '运行', '接受', '允许', '继续', '重试'
+];
+
 // Cache for the active workspace name, refreshed on each resolveTargets call
 let activeWorkspaceName = null;
 const threadNameToIdCache = new Map();
@@ -247,6 +257,12 @@ const CHAT_EXTRACT_EXPR = `
                 if (node.nodeType !== 1) return '';
                 
                 let tag = node.tagName.toLowerCase();
+                if (tag === 'img') {
+                    const src = node.currentSrc || node.src || node.getAttribute('src') || '';
+                    if (!src) return '';
+                    const alt = (node.getAttribute('alt') || node.getAttribute('title') || 'image').replace(/[\\]\\r\\n]/g, ' ').trim() || 'image';
+                    return '\\n![' + alt + '](' + src + ')\\n';
+                }
                 if (node.classList && node.classList.contains('code-block')) {
                     let lines = Array.from(node.querySelectorAll('.code-line'));
                     let code = lines.map(l => l.textContent.replace(/\\u00a0/g, ' ')).join('\\n');
@@ -782,7 +798,7 @@ async function getFullLatestResponse(port, specificTargetId = null, threadName =
     // currently selected thread, regardless of filesystem state or thread IDs.
     try {
         const domResult = await _domLatestExtraction(port, targetIdToUse);
-        if (domResult && domResult.trim().length > 10) {
+        if (domResult && domResult.trim().length > 0) {
             console.log(`[getFullLatestResponse] ✓ DOM extraction successful (${domResult.length} chars) | Target: ${targetIdToUse || 'auto'}`);
             
             // Side-effect: resolve conversation UUID from the DOM content so that
@@ -1002,7 +1018,7 @@ async function waitForAgentResponse(port, timeoutMs = 450000, onProgress = null,
                             const aaActive = !!window.__AA_BOT_OBSERVER_ACTIVE && !window.__AA_BOT_PAUSED;
                             let hasPendingButton = false;
                             if (aaActive) {
-                                const texts = ['run', 'accept', 'allow', 'continue', 'retry', 'çalıştır', 'kabul et', 'izin ver', 'devam et', 'yeniden dene'];
+                                const texts = ${JSON.stringify(PENDING_ACTION_TEXTS)};
                                 const btns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
                                 hasPendingButton = btns.some(b => {
                                     const t = (b.textContent||'').trim().toLowerCase();
@@ -1122,7 +1138,11 @@ async function sendViaCDP(text, port, specificTargetId = null) {
                             const optIndex = parseInt(escapedText) - 1;
                             const isValidIndex = !Number.isNaN(optIndex) && optIndex >= 0 && escapedText.match(/^\d+$/);
 
-                            if (approvalBtns.length > 0) {
+                            const isModalActive = container !== document || radios.length > 0 || approvalBtns.length > 0;
+                            const isConfirmAction = escapedText.toLowerCase() === 'onayla' || escapedText.toLowerCase() === 'confirm' || escapedText === 'ans_Approve';
+                            const isRejectAction = escapedText.toLowerCase() === 'reddet' || escapedText.toLowerCase() === 'reject' || escapedText === 'ans_Reject';
+                            
+                            if (isModalActive && (isConfirmAction || isRejectAction)) {
                                 if (isValidIndex && optIndex < approvalBtns.length) {
                                     approvalBtns[optIndex].click();
                                     return { found: true, method: 'approval-button-index', target: '${target.title?.substring(0, 30) || 'unknown'}' };
@@ -1132,13 +1152,21 @@ async function sendViaCDP(text, port, specificTargetId = null) {
                                     matched.click();
                                     return { found: true, method: 'approval-button-text', target: '${target.title?.substring(0, 30) || 'unknown'}' };
                                 }
-                                if (escapedText === 'ans_Approve' && approvalBtns.length > 0) {
-                                    approvalBtns[0].click();
-                                    return { found: true, method: 'approval-button-fallback-approve', target: '${target.title?.substring(0, 30) || 'unknown'}' };
-                                }
-                                if (escapedText === 'ans_Reject' && approvalBtns.length > 1) {
-                                    approvalBtns[1].click();
-                                    return { found: true, method: 'approval-button-fallback-reject', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                                
+                                const allBtns = Array.from(container.querySelectorAll('button'));
+                                const btnTarget = isConfirmAction 
+                                    ? (approvalBtns.find(b => (b.textContent||'').trim().toLowerCase() === 'approve') || allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t === 'submit' || t.startsWith('submit') || t === 'gönder' || t === 'approve' || t === 'allow' || t === 'confirm';
+                                      }))
+                                    : (approvalBtns.find(b => (b.textContent||'').trim().toLowerCase() === 'reject') || allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t === 'skip' || t === 'cancel' || t === 'iptal' || t === 'reject' || t === 'deny' || t === 'dismiss';
+                                      }));
+                                
+                                if (btnTarget) {
+                                    setTimeout(() => btnTarget.click(), 50);
+                                    return { found: true, method: 'modal_button', target: '${target.title?.substring(0, 30) || 'unknown'}' };
                                 }
                             }
 
@@ -1217,7 +1245,12 @@ async function sendViaCDP(text, port, specificTargetId = null) {
                             // Find the submit button near the editor (within same panel)
                             const panelContainer = editor.closest('#antigravity') || editor.closest('#conversation') || document;
                             // Primary: aria-label based search (most reliable in newer IDE)
-                            let submit = panelContainer.querySelector("button[aria-label='Submit'], button[aria-label='Gönder'], button[aria-label='send']");
+                            const submitTexts = ${JSON.stringify(SUBMIT_ACTION_TEXTS)};
+                            let submit = Array.from(panelContainer.querySelectorAll('button')).find(b => {
+                                if (b.offsetParent === null) return false;
+                                const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).trim().toLowerCase();
+                                return submitTexts.some(text => label === text || label.includes(text));
+                            });
                             // Secondary: SVG icon search
                             if (!submit) {
                                 submit = panelContainer.querySelector("svg.lucide-arrow-right, svg.lucide-arrow-up, svg[class*='arrow-right'], svg[class*='arrow-up'], svg[class*='send']")?.closest("button");
@@ -1226,7 +1259,7 @@ async function sendViaCDP(text, port, specificTargetId = null) {
                                 const allBtns = Array.from(panelContainer.querySelectorAll('button')).filter(b => b.offsetParent !== null);
                                 submit = allBtns.find(b => {
                                     const text = (b.textContent || '').trim().toLowerCase();
-                                    return text === 'submit' || text.startsWith('submit') || text === 'gönder' || text === 'approve' || text === 'allow';
+                                    return submitTexts.some(action => text === action || text.startsWith(action + ' '));
                                 });
                             }
                             
@@ -2142,6 +2175,9 @@ async function getCurrentModel(port) {
                     (function() {
                         const btn = AG_UI.getModelSelectorButton();
                         if (btn) {
+                            const label = btn.getAttribute('aria-label') || '';
+                            const current = label.match(/(?:current|当前)[：:]\\s*(.+)$/i);
+                            if (current && current[1]) return current[1].trim();
                             return btn.textContent.trim();
                         }
                         return null;
@@ -2215,6 +2251,8 @@ async function switchStandaloneWorkspace(port, wsName) {
 }
 
 module.exports = {
+    PENDING_ACTION_TEXTS,
+    SUBMIT_ACTION_TEXTS,
     findConversationIdByTitle,
     isAgentWorking,
     getFullLatestResponse,
@@ -2281,17 +2319,24 @@ async function getAvailableModels(port) {
             const { Runtime } = client;
             await Runtime.enable();
 
-            // Open model menu first
-            await Runtime.evaluate({
+            // Open model menu first, but avoid toggling it closed if already open.
+            const openRes = await Runtime.evaluate({
                 expression: `
                     ${UI_LOCATORS_SCRIPT}
                     (() => {
+                        const existingOptions = AG_UI.getModelOptions().filter(el => el.offsetParent !== null);
+                        if (existingOptions.length > 3) return { alreadyOpen: true };
                         const btn = AG_UI.getModelSelectorButton();
-                        if (btn) { btn.click(); return true; }
-                        return false;
+                        if (btn) { btn.click(); return { clicked: true }; }
+                        return { clicked: false };
                     })()
                 `, returnByValue: true
             });
+            const openVal = openRes.result?.value;
+            if (!openVal || (!openVal.clicked && !openVal.alreadyOpen)) {
+                await client.close();
+                continue;
+            }
 
             // Wait for dropdown to open
             await new Promise(r => setTimeout(r, 500));
@@ -2301,15 +2346,22 @@ async function getAvailableModels(port) {
                 expression: `
                     ${UI_LOCATORS_SCRIPT}
                     (() => {
+                        const cleanModelText = (text) => (text || '')
+                            .replace(/Fla\\s*h/g, 'Flash')
+                            .replace(/Fa\\s*t/g, 'Fast')
+                            .replace(/\\bOpu(?=\\s|[0-9(])/g, 'Opus')
+                            .replace(/\\s*(Fast|New)\\s*$/i, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
                         const models = [];
                         const items = AG_UI.getModelOptions();
                         items.forEach(el => {
                             if (el.offsetParent) {
-                                const t = el.textContent.trim().split('\\n')[0].trim();
+                                const t = cleanModelText(el.textContent.trim().split('\\n')[0].trim());
                                 if (t.length > 2 && t.length < 80) models.push(t);
                             }
                         });
-                        return models;
+                        return Array.from(new Set(models));
                     })()
                 `, returnByValue: true
             });
@@ -2368,19 +2420,38 @@ async function selectModel(port, modelName, specificTargetId = null) {
                 expression: `
                     ${UI_LOCATORS_SCRIPT}
                     (() => {
-                        const targetModel = ${JSON.stringify(modelName)}.toLowerCase();
+                        const normalizeModelText = (text) => (text || '')
+                            .toLowerCase()
+                            .replace(/选择模型/g, ' ')
+                            .replace(/select model/g, ' ')
+                            .replace(/current/g, ' ')
+                            .replace(/当前/g, ' ')
+                            .replace(/fla\\s*h/g, 'flash')
+                            .replace(/fa\\s*t/g, 'fast')
+                            .replace(/\\bopu(?=\\s|[0-9(])/g, 'opus')
+                            .replace(/\\bfast\\b/g, ' ')
+                            .replace(/\\bnew\\b/g, ' ')
+                            .replace(/[^a-z0-9]+/g, '');
+                        const cleanModelText = (text) => (text || '')
+                            .replace(/Fla\\s*h/g, 'Flash')
+                            .replace(/Fa\\s*t/g, 'Fast')
+                            .replace(/\\bOpu(?=\\s|[0-9(])/g, 'Opus')
+                            .replace(/\\s*(Fast|New)\\s*$/i, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const targetModel = normalizeModelText(${JSON.stringify(modelName)});
                         const modelOptions = AG_UI.getModelOptions().filter(el => el.offsetParent !== null);
                         
                         // Try exact match first
                         let match = modelOptions.find(b => {
-                            const text = b.textContent.replace(/New$/i, '').trim().toLowerCase();
+                            const text = normalizeModelText(b.textContent);
                             return text === targetModel;
                         });
                         
                         // Try partial/includes match
                         if (!match) {
                             match = modelOptions.find(b => {
-                                const text = b.textContent.replace(/New$/i, '').trim().toLowerCase();
+                                const text = normalizeModelText(b.textContent);
                                 return text.includes(targetModel) || targetModel.includes(text);
                             });
                         }
@@ -2397,7 +2468,7 @@ async function selectModel(port, modelName, specificTargetId = null) {
                         }
                         
                         // Return available models for debugging
-                        const available = modelOptions.map(b => b.textContent.replace(/New$/i, '').trim());
+                        const available = modelOptions.map(b => cleanModelText(b.textContent));
                         return { selected: false, available };
                     })()
                 `, returnByValue: true
@@ -2453,7 +2524,7 @@ async function stopAgent(port) {
     return false;
 }
 
-async function getQuota(_port, t) {
+async function getQuota(_port, t, returnRaw = false) {
     const { exec } = require('child_process');
     const { promisify } = require('util');
     const https = require('https');
@@ -2541,6 +2612,7 @@ async function getQuota(_port, t) {
 
         if (!apiData) { console.log('[Quota] No Connect RPC response'); return null; }
         console.log('[Quota] API response received');
+        if (returnRaw) return apiData;
 
         // 4. Format the response
         const userStatus = apiData.userStatus || apiData;

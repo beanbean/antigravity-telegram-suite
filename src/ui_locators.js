@@ -204,13 +204,29 @@ const UI_LOCATORS_SCRIPT = `
         },
 
         getModelSelectorButton: () => {
-            const candidates = Array.from(document.querySelectorAll('[aria-label*="Select model" i], [title*="Select model" i], [aria-label*="model" i]'));
-            return candidates.find(el => {
+            const candidates = Array.from(document.querySelectorAll(
+                '[aria-label*="Select model" i], [title*="Select model" i], [aria-label*="model" i], [aria-label*="选择模型"], [title*="选择模型"], [aria-label*="当前"]'
+            ));
+            let direct = candidates.find(el => {
                 const role = el.getAttribute('role');
                 if (role === 'tab' || role === 'treeitem') return false;
                 const label = (el.getAttribute('aria-label') || '').toLowerCase();
                 if (label.includes('.md') || label.includes('.txt') || label.includes('.js')) return false;
                 return true;
+            });
+            if (direct) return direct;
+
+            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash'];
+            const allButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
+            return allButtons.find(el => {
+                const role = el.getAttribute('role');
+                if (role === 'tab' || role === 'treeitem') return false;
+                const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.textContent || '')).toLowerCase();
+                if (label.includes('.md') || label.includes('.txt') || label.includes('.js')) return false;
+                return label.includes('选择模型') ||
+                    label.includes('select model') ||
+                    label.includes('current:') ||
+                    modelKeywords.some(k => label.includes(k));
             }) || null;
         },
 
@@ -220,7 +236,7 @@ const UI_LOCATORS_SCRIPT = `
          */
         getModelOptions: () => {
             const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash'];
-            const candidates = Array.from(document.querySelectorAll('button.px-2.py-1, [role="option"], [role="menuitemradio"], .model-option'));
+            const candidates = Array.from(document.querySelectorAll('button, [role="option"], [role="menuitem"], [role="menuitemradio"], .model-option'));
             return candidates.filter(el => {
                 const text = (el.textContent || '').toLowerCase();
                 return modelKeywords.some(k => text.includes(k));

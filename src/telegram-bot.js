@@ -3,6 +3,8 @@ const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const http = require('http');
+const https = require('https');
 const { exec } = require('child_process');
 const { loadLocale, t, getLang } = require('./i18n');
 const axios = require('axios');
@@ -15,6 +17,9 @@ const autoaccept = require('./autoaccept');
 const updater = require('./updater');
 const { runTurboOrchestration } = require('./turbo_orchestrator');
 const TaskWatcher = require('./task_watcher');
+const { extractLocalImageMarkdown } = require('./local_media');
+const { enqueueByKey } = require('./message_queue');
+const { ensureCdpReady, isConnectionRefusedError } = require('./cdp_health');
 let scheduleClient = null;
 try {
     scheduleClient = require('./schedule_client');
@@ -97,6 +102,7 @@ function saveMessageTargetMap(map) {
     } catch (err) { console.error('Failed to save messageTargetMap:', err.message); }
 }
 const messageTargetMap = loadMessageTargetMap();
+const textMessageQueues = new Map();
 
 const LANG_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'lang.txt');
 
@@ -211,7 +217,7 @@ const TURBO_SAFE_COMMANDS = [
     '/turbo', '/stop', '/screenshot', '/latest', '/status',
     '/quota', '/help', '/version', '/panel', '/menu',
     '/file', '/cmd', '/autoaccept', '/lang', '/window',
-    '/artifacts'
+    '/artifacts', '/restart'
 ];
 const TURBO_SAFE_BUTTONS = [
     '📸', '💬', '📦', '📊', '🚀'
@@ -233,7 +239,10 @@ bot.use(async (ctx, next) => {
             if (isSafeCmd || isSafeBtn) {
                 return next();
             }
-            return ctx.reply(t('turbo.is_running') || '⏳ Turbo Mode is running!');
+            return ctx.reply('⏳ Turbo Mode is currently running! Are you sure you want to stop it?', Markup.inlineKeyboard([
+                [Markup.button.callback('🛑 Force Stop Turbo', 'turbo_force_stop')],
+                [Markup.button.callback('❌ Cancel', 'turbo_cancel')]
+            ]));
         } else if (cbData) {
             if (cbData.startsWith('file_') || cbData.startsWith('artifact_') || cbData.startsWith('turbo_')) {
                 return next();
@@ -241,7 +250,10 @@ bot.use(async (ctx, next) => {
             return ctx.answerCbQuery(t('turbo.is_running_short') || '⏳ Please wait', { show_alert: true }).catch(()=>{});
         } else if (ctx.message?.photo || ctx.message?.document) {
             // Block file/photo uploads during turbo as they trigger sendViaCDP paste
-            return ctx.reply(t('turbo.is_running') || '⏳ Turbo Mode is running!');
+            return ctx.reply('⏳ Turbo Mode is currently running! Are you sure you want to stop it?', Markup.inlineKeyboard([
+                [Markup.button.callback('🛑 Force Stop Turbo', 'turbo_force_stop')],
+                [Markup.button.callback('❌ Cancel', 'turbo_cancel')]
+            ]));
         }
     }
     return next();
@@ -253,6 +265,21 @@ function getCDPPort(app = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') {
     return parseInt(process.env.AGENT_CDP_PORT || process.env.DEBUGGING_PORT || '9333', 10);
 }
 let CDP_PORT = getCDPPort();
+
+async function sendViaCDPWithRecovery(text, specificTargetId = null) {
+    const app = config.preferredApp || 'agent';
+    await ensureCdpReady({ port: CDP_PORT, app });
+    try {
+        return await sendViaCDP(text, CDP_PORT, specificTargetId);
+    } catch (err) {
+        if (!isConnectionRefusedError(err)) {
+            throw err;
+        }
+        console.warn(`[cdp] Port ${CDP_PORT} refused connection; restarting ${app} with CDP and retrying once.`);
+        await ensureCdpReady({ port: CDP_PORT, app });
+        return sendViaCDP(text, CDP_PORT, null);
+    }
+}
 
 function updateEnvFile(key, value) {
     const envPath = path.join(__dirname, '..', '.env');
@@ -376,9 +403,78 @@ function markdownToTelegramHtml(text) {
     return html;
 }
 
+function downloadLocalImageUrl(rawUrl) {
+    return new Promise((resolve, reject) => {
+        let parsed;
+        try {
+            parsed = new URL(rawUrl);
+        } catch (err) {
+            reject(err);
+            return;
+        }
+
+        const client = parsed.protocol === 'https:' ? https : http;
+        const onResponse = (res) => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
+                reject(new Error(`HTTP ${res.statusCode}`));
+                return;
+            }
+
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => {
+                const filename = path.basename(parsed.pathname) || 'image';
+                resolve({ buffer: Buffer.concat(chunks), filename });
+            });
+        };
+        const req = parsed.protocol === 'https:'
+            ? client.get(parsed, { rejectUnauthorized: false }, onResponse)
+            : client.get(parsed, onResponse);
+
+        req.setTimeout(15000, () => req.destroy(new Error('download timeout')));
+        req.on('error', reject);
+    });
+}
+
+async function sendExtractedImage(ctx, image, replyToMsgId = null) {
+    const replyOptions = replyToMsgId
+        ? { reply_parameters: { message_id: replyToMsgId, allow_sending_without_reply: true } }
+        : undefined;
+
+    if (image.type === 'url') {
+        const downloaded = await downloadLocalImageUrl(image.path);
+        await ctx.replyWithPhoto(
+            { source: downloaded.buffer, filename: downloaded.filename },
+            replyOptions
+        );
+        return;
+    }
+
+    if (!fs.existsSync(image.path)) {
+        console.warn(`[local_media] Image not found: ${image.path}`);
+        return;
+    }
+
+    await ctx.replyWithPhoto(
+        { source: image.path },
+        replyOptions
+    );
+}
+
 // Helper: Send long messages safely within Telegram's 4096 char limit
 async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMsgId = null) {
     const MAX_LEN = 3500;
+    const localMedia = extractLocalImageMarkdown(text);
+    text = localMedia.text;
+
+    for (const image of localMedia.images) {
+        try {
+            await sendExtractedImage(ctx, image, replyToMsgId);
+        } catch (err) {
+            console.warn(`[local_media] Failed to send image ${image.path}: ${err.message}`);
+        }
+    }
     
     // Parse text to HTML and preserve prefix formatting
     const htmlText = prefix ? `<b>${prefix}</b>\n\n${markdownToTelegramHtml(text)}` : markdownToTelegramHtml(text);
@@ -2399,10 +2495,12 @@ bot.command('lang', async (ctx) => {
     
     const langMap = {
         'en': '🇬🇧 English',
+        'zh': '🇨🇳 中文',
         'tr': '🇹🇷 Türkçe',
         'es': '🇪🇸 Español',
         'fr': '🇫🇷 Français',
-        'de': '🇩🇪 Deutsch'
+        'de': '🇩🇪 Deutsch',
+        'ko': '🇰🇷 한국어'
     };
     
     const buttons = availableLangs.map(l => {
@@ -3138,6 +3236,18 @@ async function handleTurbo(ctx) {
 bot.command('turbo', handleTurbo);
 bot.hears(/^🚀/i, handleTurbo);
 
+bot.action('turbo_force_stop', async (ctx) => {
+    isTurboRunning = false;
+    isTurboMode = false;
+    saveTurboState();
+    try { stopAgent(CDP_PORT); } catch(e) {}
+    await ctx.editMessageText('🛑 Turbo Mode has been force stopped. You can now send your message.').catch(() => {});
+});
+
+bot.action('turbo_cancel', async (ctx) => {
+    await ctx.deleteMessage().catch(() => {});
+});
+
 // ===== TEXT MESSAGE HANDLER (Headless mode) =====
 
 bot.command('panel', async (ctx) => {
@@ -3289,7 +3399,7 @@ async function handleAgentQuery(ctx, query, explicitTargetId = null, explicitThr
                 isTurboRunning = false;
             }
         } else {
-            targetId = await sendViaCDP(query, CDP_PORT, explicitTargetId);
+            targetId = await sendViaCDPWithRecovery(query, explicitTargetId);
             setReaction(ctx, REACTION.THINKING);
 
             // Wait briefly for message to render in DOM before anchoring state

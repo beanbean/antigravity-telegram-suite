@@ -4,7 +4,7 @@
 
 **Hem [Antigravity Standalone App](https://antigravity.google/)\* hem de [Antigravity IDE](https://antigravity.google/) ile çalışır.**
 
-🌍 Diller: [English](README.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
+🌍 Diller: [English](README.md) | [中文](README.zh.md) | [한국어](README.ko.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
 
 Antigravity AI ajanınızı Telegram üzerinden uzaktan kontrol edin.
 Telefonunuzdan mesaj gönderin, yapay zeka modellerini değiştirin, çalışma alanlarını (workspace) yönetin, ekran görüntüsü alın ve çoklu ajan (multi-agent) iş akışlarını çalıştırın.
@@ -40,7 +40,7 @@ Telefonunuzdan mesaj gönderin, yapay zeka modellerini değiştirin, çalışma 
 | 🔔 **Proaktif Bildirimler** | TaskWatcher, ajanın kendiliğinden gönderdiği mesajları (timer, alt-ajan) Telegram’a iletir |
 | 🤔 **Mesaj Reaksiyonları** | İşlem sırasında 🤔 gösterir, tamamlanınca temizler |
 | 🔄 **Oto-Güncelleme** | Tek bir komutla güncellemeleri kontrol edin ve botu güncelleyin |
-| 🌐 **Çoklu Dil** | 5 dil desteği: İngilizce, Türkçe, Almanca, İspanyolca, Fransızca |
+| 🌐 **Çoklu Dil** | 7 dil desteği: İngilizce, Çince, Korece, Türkçe, Almanca, İspanyolca, Fransızca |
 | ⌨️ **Yazıyor Göstergesi** | Ajan çalışırken Telegram’da "yazıyor..." durumunu gösterir |
 | 🖥️ **Çapraz Platform** | Linux, macOS (Intel & Apple Silicon) ve Windows’ta çalışır |
 | 🔀 **Çift Uygulama Desteği** | Antigravity IDE ve Standalone App arasında sorunsuzca geçiş yapın |
@@ -83,7 +83,7 @@ IDE_CDP_PORT=9334      # Antigravity IDE için port
 # Yeni sohbetlerde otomatik seçilecek yapay zeka modeli
 DEFAULT_MODEL=Gemini 3.1 Pro (High)
 
-# Dil: en | tr | de | es | fr
+# Dil: en | zh | ko | tr | de | es | fr
 LANGUAGE=tr
 
 # Tercih edilen uygulama: 'agent' (Standalone) veya 'ide' (IDE)
@@ -269,6 +269,8 @@ antigravity-telegram-suite/
 │   └── platform.js           # Çapraz platform OS soyutlaması
 ├── locales/
 │   ├── en.json               # İngilizce
+│   ├── zh.json               # Çince (中文)
+│   ├── ko.json               # Korece (한국어)
 │   ├── tr.json               # Türkçe
 │   ├── de.json               # Almanca
 │   ├── es.json               # İspanyolca
@@ -323,6 +325,8 @@ Bot eşzamanlı çalışan **iki Antigravity uygulamasını** destekler:
 - **[acmavirus/antigravity-telegram-control](https://github.com/acmavirus/antigravity-telegram-control)** — Bu projenin temelini oluşturan açık kaynak Telegram entegrasyonu
 - **[yazanbaker94/AntiGravity-AutoAccept](https://github.com/yazanbaker94/AntiGravity-AutoAccept)** — Auto-Accept modülünde DOM observer deseni ilham kaynağı
 - **[vassoz](https://github.com/vassoz)** — PR #12: CDP bağlantısı, otomatik X11 ekran tespiti ve dinamik port kısayolları onarımları
+- **[wade19990814-hue](https://github.com/wade19990814-hue)** — PR #14: Chinese (中文) localization
+- **[ienground](https://github.com/ienground)** — PR #17: Korean (한국어) localization
 
 ## 🌟 Krediler & İlham Kaynakları
 

@@ -4,7 +4,7 @@
 
 **Funciona tanto con la [Antigravity Standalone App](https://antigravity.google/)\* como con el [Antigravity IDE](https://antigravity.google/).**
 
-🌍 Idiomas: [English](README.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
+🌍 Idiomas: [English](README.md) | [中文](README.zh.md) | [한국어](README.ko.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
 
 Controla tu agente de IA Antigravity de forma remota a través de Telegram.
 Envía mensajes, cambia modelos de IA, administra espacios de trabajo, toma capturas de pantalla y ejecuta flujos de trabajo de múltiples agentes, todo desde tu teléfono.
@@ -40,7 +40,7 @@ Envía mensajes, cambia modelos de IA, administra espacios de trabajo, toma capt
 | 🔔 **Notificaciones Proactivas** | TaskWatcher detecta mensajes no solicitados del agente (timers, sub-agentes) y los reenvía a Telegram |
 | 🤔 **Reacciones en Mensajes** | Muestra 🤔 durante el procesamiento, lo elimina al terminar |
 | 🔄 **Actualización Automática** | Comprueba si hay actualizaciones y actualiza el bot con un solo comando |
-| 🌐 **Multi-Idioma** | 5 idiomas compatibles: Inglés, Turco, Alemán, Español, Francés |
+| 🌐 **Multi-Idioma** | 7 idiomas compatibles: Inglés, Chino, Coreano, Turco, Alemán, Español, Francés |
 | ⌨️ **Indicador de Escritura** | Muestra "escribiendo..." en Telegram mientras el agente está trabajando |
 | 🖥️ **Multi-Plataforma** | Funciona en Linux, macOS (Intel y Apple Silicon) y Windows |
 | 🔀 **Soporte de Aplicación Dual** | Cambia sin problemas entre Antigravity IDE y Standalone Agent App |
@@ -83,7 +83,7 @@ IDE_CDP_PORT=9334      # Puerto para el Antigravity IDE
 # Modelo de IA predeterminado al iniciar un nuevo chat
 DEFAULT_MODEL=Gemini 3.1 Pro (High)
 
-# Idioma: en | tr | de | es | fr
+# Idioma: en | zh | ko | tr | de | es | fr
 LANGUAGE=es
 
 # Aplicación de destino preferida: 'agent' (Standalone) o 'ide' (IDE)
@@ -269,6 +269,8 @@ antigravity-telegram-suite/
 │   └── platform.js           # Abstracción de sistema operativo (iniciar, cerrar, rutas)
 ├── locales/
 │   ├── en.json               # Inglés
+│   ├── zh.json               # Chino (中文)
+│   ├── ko.json               # Coreano (한국어)
 │   ├── tr.json               # Turco
 │   ├── de.json               # Alemán
 │   ├── es.json               # Español
@@ -349,6 +351,8 @@ Utiliza `/app` para cambiar el enfoque del bot entre las aplicaciones. La config
 - **[acmavirus/antigravity-telegram-control](https://github.com/acmavirus/antigravity-telegram-control)** — Integración de Telegram de código abierto que sirvió de base para este proyecto
 - **[yazanbaker94/AntiGravity-AutoAccept](https://github.com/yazanbaker94/AntiGravity-AutoAccept)** — Inspiración para el patrón de observador del DOM en el módulo de Auto-Aceptación
 - **[vassoz](https://github.com/vassoz)** — PR #12: Correcciones de conexión CDP, detección automática de pantalla X11 y accesos directos de puertos dinámicos
+- **[wade19990814-hue](https://github.com/wade19990814-hue)** — PR #14: Chinese (中文) localization
+- **[ienground](https://github.com/ienground)** — PR #17: Korean (한국어) localization
 
 ## 🌟 Créditos e Inspiraciones
 

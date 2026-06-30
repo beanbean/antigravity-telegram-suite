@@ -7,9 +7,24 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT) || 900000;
+const CLAUDE_SETTINGS_FILE = process.env.CLAUDE_SETTINGS_FILE || '';
+
+// Load ANTHROPIC_AUTH_TOKEN1 from ~/.env.secrets if not already in env
+function loadClaudibleToken() {
+  if (process.env.CLAUDIBLE_AUTH_TOKEN) return process.env.CLAUDIBLE_AUTH_TOKEN;
+  try {
+    const secrets = fs.readFileSync(path.join(os.homedir(), '.env.secrets'), 'utf-8');
+    const match = secrets.match(/^export\s+ANTHROPIC_AUTH_TOKEN1=["']?([^"'\n]+)["']?/m);
+    if (match) return match[1].trim();
+  } catch {}
+  return '';
+}
+const CLAUDIBLE_AUTH_TOKEN = loadClaudibleToken();
 
 // Session tracking: chatId -> { sessionId, proc }
 const sessions = new Map();
@@ -37,15 +52,25 @@ function sendToClaude(prompt, opts = {}) {
       args.push('--model', model);
     }
 
+    if (CLAUDE_SETTINGS_FILE) {
+      args.push('--settings', CLAUDE_SETTINGS_FILE);
+    }
+
     if (skipPermissions) {
       args.push('--dangerously-skip-permissions');
     }
 
     const cwd = workDir || process.env.CLAUDE_WORK_DIR || process.env.HOME;
 
+    // Pass claudible auth token if configured (used with --settings claudible-settings.json)
+    const spawnEnv = { ...process.env, NO_COLOR: '1' };
+    if (CLAUDIBLE_AUTH_TOKEN) {
+      spawnEnv.ANTHROPIC_AUTH_TOKEN = CLAUDIBLE_AUTH_TOKEN;
+    }
+
     const proc = spawn(CLAUDE_BIN, args, {
       cwd,
-      env: { ...process.env, NO_COLOR: '1' },
+      env: spawnEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 

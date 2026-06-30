@@ -138,8 +138,18 @@ if (ALLOWED_CHAT_IDS.length === 0) {
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 900000 }); // 15 minutes timeout to allow long /ask requests
 
 startCronJobs(bot); // Khởi chạy finance cron jobs
-const { startBrain2Cron } = require('./brain2-cron');
+const { startBrain2Cron, isCronReply, buildCronContext, sendTestCron } = require('./brain2-cron');
 startBrain2Cron(bot); // Brain2 autonomous cron (03h/06h/09h/20h)
+
+// /testcron — send a test Brain2 cron message for reply testing
+bot.command('testcron', async (ctx) => {
+    try {
+        await sendTestCron(bot);
+        ctx.reply('✅ Test cron sent — reply tin đó để test context flow');
+    } catch (e) {
+        ctx.reply('❌ ' + e.message);
+    }
+});
 
 // --- FINANCE BOT COMMANDS ---
 bot.command('tuvan', async (ctx) => {
@@ -3347,6 +3357,27 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
 
 bot.on('text', (ctx) => {
     if (ctx.message.text.startsWith('/') || ctx.message.text.startsWith('!')) return;
+
+    // ---- BRAIN2 CRON REPLY detection ----
+    if (ctx.message.reply_to_message) {
+        const cronInfo = isCronReply(ctx.message.reply_to_message.message_id);
+        if (cronInfo) {
+            // Route to An with fresh context (new chat + injected prompt)
+            const contextQuery = buildCronContext(cronInfo, ctx.message.text);
+            console.log(`[Brain2Cron] Reply detected for ${cronInfo.jobId} — opening new chat`);
+            (async () => {
+                try {
+                    await triggerNewChat(CDP_PORT);
+                    await new Promise(r => setTimeout(r, 1500));
+                    await handleAgentQuery(ctx, contextQuery, null, null);
+                } catch (e) {
+                    console.error('[Brain2Cron] Reply handling failed:', e.message);
+                    ctx.reply('⚠️ Xử lý reply thất bại: ' + e.message);
+                }
+            })();
+            return;
+        }
+    }
 
     // ---- CLAUDE CODE routing ----
     if (currentEngine === 'claude') {

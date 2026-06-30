@@ -203,12 +203,15 @@ const UI_LOCATORS_SCRIPT = `
             }) || null;
         },
 
-        /**
-         * Retrieves the model selector dropdown button.
-         * @returns {HTMLElement|null}
-         */
         getModelSelectorButton: () => {
-            return document.querySelector('[aria-label*="Select model" i], [title*="Select model" i], [aria-label*="model" i]') || null;
+            const candidates = Array.from(document.querySelectorAll('[aria-label*="Select model" i], [title*="Select model" i], [aria-label*="model" i]'));
+            return candidates.find(el => {
+                const role = el.getAttribute('role');
+                if (role === 'tab' || role === 'treeitem') return false;
+                const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('.md') || label.includes('.txt') || label.includes('.js')) return false;
+                return true;
+            }) || null;
         },
 
         /**

@@ -46,7 +46,7 @@ function buildCronContext(cronInfo, userReply) {
 
 const VAULT_DIR = path.join(
   process.env.HOME,
-  'Library/Mobile Documents/iCloud~md~obsidian/Documents/BrainCong/Brain2'
+  'Library/Mobile Documents/iCloud~md~obsidian/Documents/BrainCong/nexmeOS'
 );
 const HOTBRAIN_QUERY = path.join(VAULT_DIR, 'scripts/hotbrain-query.sh');
 const MANIFEST_PATH = path.join(VAULT_DIR, 'scripts/cron/manifest.json');

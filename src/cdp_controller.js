@@ -1096,19 +1096,27 @@ async function sendViaCDP(text, port, specificTargetId = null) {
 
     if (specificTargetId) {
         sortedCandidates = candidates.filter(t => t.id && t.id.startsWith(specificTargetId));
-    } else if (preferredTargetId) {
-        const pref = candidates.find(t => t.id === preferredTargetId);
-        if (pref && pref.title) {
-            const shortTitle = pref.title.substring(0, 15); // Match base workspace name
-            sortedCandidates = candidates.filter(t => t.id === preferredTargetId || (t.title && t.title.includes(shortTitle)));
-        } else {
-            sortedCandidates = candidates.filter(t => t.id === preferredTargetId);
+        if (sortedCandidates.length === 0) {
+            console.log(`[sendViaCDP] specificTargetId ${specificTargetId} not found, falling back.`);
+            specificTargetId = null;
         }
-    } else if (activeWorkspaceName) {
-        const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
-        const searchName = normalize(activeWorkspaceName);
-        sortedCandidates = candidates.filter(t => normalize(t.title).includes(searchName));
-        if (sortedCandidates.length === 0) sortedCandidates = candidates; // Fallback if none match
+    }
+    
+    if (!specificTargetId) {
+        if (preferredTargetId) {
+            const pref = candidates.find(t => t.id === preferredTargetId);
+            if (pref && pref.title) {
+                const shortTitle = pref.title.substring(0, 15); // Match base workspace name
+                sortedCandidates = candidates.filter(t => t.id === preferredTargetId || (t.title && t.title.includes(shortTitle)));
+            } else {
+                sortedCandidates = candidates.filter(t => t.id === preferredTargetId);
+            }
+        } else if (activeWorkspaceName) {
+            const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+            const searchName = normalize(activeWorkspaceName);
+            sortedCandidates = candidates.filter(t => normalize(t.title).includes(searchName));
+            if (sortedCandidates.length === 0) sortedCandidates = candidates; // Fallback if none match
+        }
     }
 
     const errors = [];

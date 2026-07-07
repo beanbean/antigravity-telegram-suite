@@ -1163,7 +1163,7 @@ bot.action('engine_claude', async (ctx) => {
 });
 
 // ===== CLAUDE CODE QUERY HANDLER =====
-async function handleClaudeQuery(ctx, query) {
+async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
     const chatId = String(ctx.chat.id);
     if (isSessionActive(chatId)) {
         return ctx.reply('⏳ Claude đang xử lý. /stop để huỷ.');
@@ -1177,7 +1177,7 @@ async function handleClaudeQuery(ctx, query) {
 
     try {
         // Auto-resume latest session if none set
-        let sessionId = getLastSessionId(chatId);
+        let sessionId = explicitSessionId || getLastSessionId(chatId);
         if (!sessionId) {
             const latest = getLatestSessionId(CLAUDE_WORK_DIR);
             if (latest) { sessionId = latest; setActiveSession(chatId, latest); }
@@ -1223,7 +1223,11 @@ async function handleClaudeQuery(ctx, query) {
         const footer = `\n\n⏱ ${(result.duration / 1000).toFixed(1)}s` +
             (result.toolsUsed.length ? ` | 🛠 ${result.toolsUsed.join(', ')}` : '');
 
-        await sendLongMessage(ctx, result.text + footer, '🤖 Claude Code');
+        const sentIds = await sendLongMessage(ctx, result.text + footer, '🤖 Claude Code');
+        if (sentIds && sentIds.length > 0 && result.sessionId) {
+            sentIds.forEach(id => messageTargetMap.set(id, { claudeSessionId: result.sessionId }));
+            saveMessageTargetMap(messageTargetMap);
+        }
     } catch (err) {
         clearInterval(typingInterval);
         ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
@@ -3446,19 +3450,25 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
     const skillArgs = ctx.match[2] ? ctx.match[2].trim() : '';
     const query = `/${skillName} ${skillArgs}`.trim();
     
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        return handleClaudeQuery(ctx, query).catch(() => {});
-    }
-    
     let explicitTargetId = null;
     let explicitThreadName = null;
+    let explicitClaudeSessionId = null;
     if (ctx.message.reply_to_message) {
         const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
         if (typeof val === 'string') explicitTargetId = val;
-        else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
+        else if (val) { 
+            explicitTargetId = val.targetId; 
+            explicitThreadName = val.threadName;
+            explicitClaudeSessionId = val.claudeSessionId;
+        }
     }
     if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
         explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
+    }
+
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        if (explicitClaudeSessionId) setActiveSession(String(ctx.chat.id), explicitClaudeSessionId);
+        return handleClaudeQuery(ctx, query, explicitClaudeSessionId).catch(() => {});
     }
     
     await handleAgentQuery(ctx, query, explicitTargetId, explicitThreadName);
@@ -3488,27 +3498,33 @@ bot.on('text', (ctx) => {
         }
     }
 
-    // ---- CLAUDE CODE routing ----
-    if (currentEngine === 'claude') {
-        return handleClaudeQuery(ctx, ctx.message.text).catch(() => {});
-    }
-
-    // ---- ANTIGRAVITY routing (existing) ----
     let query = ctx.message.text;
-    
     let explicitTargetId = null;
     let explicitThreadName = null;
+    let explicitClaudeSessionId = null;
+
     if (ctx.message.reply_to_message) {
         const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
         if (typeof val === 'string') explicitTargetId = val;
-        else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
+        else if (val) { 
+            explicitTargetId = val.targetId; 
+            explicitThreadName = val.threadName;
+            explicitClaudeSessionId = val.claudeSessionId;
+        }
         
         query = extractQuotedContext(ctx) + query;
     }
     if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
         explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
     }
-    
+
+    // ---- CLAUDE CODE routing ----
+    if (currentEngine === 'claude') {
+        if (explicitClaudeSessionId) setActiveSession(String(ctx.chat.id), explicitClaudeSessionId);
+        return handleClaudeQuery(ctx, query, explicitClaudeSessionId).catch(() => {});
+    }
+
+    // ---- ANTIGRAVITY routing (existing) ----
     handleAgentQuery(ctx, query, explicitTargetId, explicitThreadName).catch(()=>{});
 });
 
@@ -3575,6 +3591,13 @@ async function processMediaGroup(group) {
 bot.on(['photo', 'document'], (ctx) => {
     (async () => {
         try {
+            if (ctx.message.document) {
+                const mime = ctx.message.document.mime_type || '';
+                const fname = (ctx.message.document.file_name || '').toLowerCase();
+                if (mime.startsWith('audio/') || fname.endsWith('.m4a') || fname.endsWith('.mp3') || fname.endsWith('.wav') || fname.endsWith('.ogg')) {
+                    return handleAudioTranscription(ctx, ctx.message.document.file_id);
+                }
+            }
             let fileId;
             let fileName = "telegram_upload";
             
@@ -3730,27 +3753,40 @@ bot.on(['photo', 'document'], (ctx) => {
     })();
 });
 
-// ===== VOICE HANDLER (WHISPER.CPP) =====
-bot.on('voice', async (ctx) => {
-    (async () => {
+
+// ===== AUDIO/VOICE TRANSCRIPTION (WHISPER.CPP) =====
+async function handleAudioTranscription(ctx, fileId) {
+
         try {
-            const msg = await ctx.reply('🎧 Đang tải và giải mã giọng nói (Local AI)...');
+            const msg = await ctx.reply('🎧 Đang tải và giải mã âm thanh (Local AI)...');
             
-            const fileId = ctx.message.voice.file_id;
+            
             const link = await ctx.telegram.getFileLink(fileId);
             
-            const tmpOgg = path.join(os.tmpdir(), `voice_${Date.now()}.ogg`);
+            const tmpAudio = path.join(os.tmpdir(), `voice_${Date.now()}.ogg`);
             const tmpWav = path.join(os.tmpdir(), `voice_${Date.now()}.wav`);
             
             // Download file
-            const response = await fetch(link.href);
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            const arrayBuffer = await response.arrayBuffer();
-            fs.writeFileSync(tmpOgg, Buffer.from(arrayBuffer));
+            const https = require('https');
+            await new Promise((resolve, reject) => {
+                const file = fs.createWriteStream(tmpAudio);
+                https.get(link.href, function(response) {
+                    if (response.statusCode !== 200) {
+                        return reject(new Error(`HTTP error! status: ${response.statusCode}`));
+                    }
+                    response.pipe(file);
+                    file.on('finish', function() {
+                        file.close(resolve);
+                    });
+                }).on('error', function(err) {
+                    fs.unlink(tmpAudio, () => {});
+                    reject(err);
+                });
+            });
             
             // Convert to WAV
             await new Promise((resolve, reject) => {
-                exec(`/opt/homebrew/bin/ffmpeg -i ${tmpOgg} -ar 16000 -ac 1 -c:a pcm_s16le ${tmpWav} -y`, (err) => {
+                exec(`/opt/homebrew/bin/ffmpeg -i ${tmpAudio} -ar 16000 -ac 1 -c:a pcm_s16le ${tmpWav} -y`, (err) => {
                     if (err) reject(err); else resolve();
                 });
             });
@@ -3808,16 +3844,25 @@ bot.on('voice', async (ctx) => {
             await handleAgentQuery(ctx, query, explicitTargetId, explicitThreadName);
             
             // Cleanup
-            fs.unlinkSync(tmpOgg);
+            fs.unlinkSync(tmpAudio);
             fs.unlinkSync(tmpWav);
             
         } catch(err) {
             console.error('Voice Error:', err);
             const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
-            ctx.reply('❌ Lỗi xử lý giọng nói: ' + errorMsg).catch(() => {});
+            ctx.reply('❌ Lỗi xử lý âm thanh: ' + errorMsg).catch(() => {});
         }
-    })();
+    
+}
+
+bot.on('voice', async (ctx) => {
+    await handleAudioTranscription(ctx, ctx.message.voice.file_id);
 });
+
+bot.on('audio', async (ctx) => {
+    await handleAudioTranscription(ctx, ctx.message.audio.file_id);
+});
+
 
 // ===== LAUNCH =====
 

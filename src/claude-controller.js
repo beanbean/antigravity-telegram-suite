@@ -7,6 +7,7 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const { withVaultWriteGate } = require('./vault-write-policy');
 const fs = require('fs');
 const os = require('os');
 
@@ -39,7 +40,8 @@ function sendToClaude(prompt, opts = {}) {
   const { chatId, workDir, model, skipPermissions, resumeSessionId, onEvent } = opts;
 
   return new Promise((resolve, reject) => {
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
+    const gatedPrompt = withVaultWriteGate(prompt);
+    const args = ['-p', gatedPrompt, '--output-format', 'stream-json', '--verbose'];
 
     // Resume existing session (prefer explicit resumeSessionId)
     const session = sessions.get(chatId);
@@ -216,6 +218,113 @@ function getLastSessionId(chatId) {
   return sessions.get(chatId)?.sessionId || null;
 }
 
+// ===== Claude Code models from ~/.claude/settings.json =====
+const CLAUDE_SETTINGS_PATH =
+  process.env.CLAUDE_SETTINGS_JSON || path.join(os.homedir(), '.claude', 'settings.json');
+const claudeModelsCache = { at: 0, models: [], source: '' };
+const CLAUDE_MODELS_CACHE_MS = 30 * 1000;
+const CLAUDE_MODEL_ID_RE = /^[a-z0-9][\w.+\-\/]*(?:\[[^\]]+\])?$/i;
+
+function clearClaudeModelsCache() {
+  claudeModelsCache.at = 0;
+  claudeModelsCache.models = [];
+  claudeModelsCache.source = '';
+}
+
+/**
+ * Models configured for this Claude Code install.
+ * Prefer settings.json → models[] (exact IDs with prefixes: kr/..., gcli/..., 9f/pro/...).
+ * Also surface ANTHROPIC_DEFAULT_* targets so mapped full IDs appear.
+ * @param {{ force?: boolean }} opts
+ * @returns {Promise<{ models: Array<{id:string,label:string}>, source: string, error?: string }>}
+ */
+function listClaudeModels(opts = {}) {
+  const force = !!opts.force;
+  if (!force && claudeModelsCache.models.length && Date.now() - claudeModelsCache.at < CLAUDE_MODELS_CACHE_MS) {
+    return Promise.resolve({
+      models: claudeModelsCache.models,
+      source: claudeModelsCache.source || 'cache',
+    });
+  }
+
+  return new Promise((resolve) => {
+    const settingsPath = CLAUDE_SETTINGS_FILE || CLAUDE_SETTINGS_PATH;
+    let data;
+    try {
+      if (!fs.existsSync(settingsPath)) {
+        return resolve({
+          models: [],
+          source: 'fallback',
+          error: `settings not found: ${settingsPath}`,
+        });
+      }
+      data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch (e) {
+      return resolve({
+        models: [],
+        source: 'fallback',
+        error: `parse settings: ${(e && e.message) || e}`.slice(0, 160),
+      });
+    }
+
+    const models = [];
+    const seen = new Set();
+    function push(id, label) {
+      const clean = String(id || '').trim();
+      if (!clean) return;
+      if (clean.length > 120) return;
+      if (!CLAUDE_MODEL_ID_RE.test(clean) && !['haiku', 'sonnet', 'opus', 'auto'].includes(clean)) return;
+      const key = clean.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      models.push({ id: clean, label: label ? `${clean} — ${label}` : clean });
+    }
+
+    const list = Array.isArray(data.models) ? data.models : [];
+    for (const m of list) {
+      if (typeof m === 'string') {
+        push(m, null);
+        continue;
+      }
+      if (!m || typeof m !== 'object') continue;
+      const id = m.id || m.model || m.name || m.value;
+      const name = m.name || m.displayName || m.label || null;
+      push(id, name && name !== id ? name : null);
+    }
+
+    const env = data.env || {};
+    for (const target of [
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+      env.CLAUDE_CODE_SUBAGENT_MODEL,
+    ]) {
+      if (target) push(String(target).trim(), 'env default');
+    }
+
+    if (data.model) push(String(data.model).trim(), 'default');
+
+    if (!models.length) {
+      push('haiku', 'built-in alias');
+      push('sonnet', 'built-in alias');
+      push('opus', 'built-in alias');
+      claudeModelsCache.at = Date.now();
+      claudeModelsCache.models = models;
+      claudeModelsCache.source = 'fallback-aliases';
+      return resolve({
+        models,
+        source: 'fallback-aliases',
+        error: 'models[] empty in settings — used built-in aliases',
+      });
+    }
+
+    claudeModelsCache.at = Date.now();
+    claudeModelsCache.models = models;
+    claudeModelsCache.source = 'claude-settings-models';
+    resolve({ models, source: 'claude-settings-models' });
+  });
+}
+
 module.exports = {
   sendToClaude,
   cancelSession,
@@ -223,5 +332,7 @@ module.exports = {
   isSessionActive,
   getSessionInfo,
   setActiveSession,
-  getLastSessionId
+  getLastSessionId,
+  listClaudeModels,
+  clearClaudeModelsCache,
 };

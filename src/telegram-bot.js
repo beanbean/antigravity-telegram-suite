@@ -19,6 +19,7 @@ const { runTurboOrchestration } = require('./turbo_orchestrator');
 const TaskWatcher = require('./task_watcher');
 const { extractLocalImageMarkdown } = require('./local_media');
 const { ensureCdpReady, isConnectionRefusedError } = require('./cdp_health');
+const { createDailyLoop } = require('./daily-loop');
 let scheduleClient = null;
 try {
     scheduleClient = require('./schedule_client');
@@ -27,24 +28,80 @@ try {
 }
 
 // ===== CLAUDE CODE ENGINE =====
-const { sendToClaude, cancelSession, resetSession, isSessionActive, getSessionInfo, setActiveSession, getLastSessionId } = require('./claude-controller');
+const {
+    sendToClaude,
+    cancelSession,
+    resetSession,
+    isSessionActive,
+    getSessionInfo,
+    setActiveSession,
+    getLastSessionId,
+    listClaudeModels,
+    clearClaudeModelsCache,
+} = require('./claude-controller');
 const { listSessions, getLatestSessionId, formatRelativeTime } = require('./session-store');
+
+// ===== CURSOR AGENT ENGINE =====
+const cursorCtrl = require('./cursor-controller');
+const { withVaultWriteGate } = require('./vault-write-policy');
+const {
+    sendToCursor,
+    cancelSession: cancelCursorSession,
+    resetSession: resetCursorSession,
+    isSessionActive: isCursorSessionActive,
+    getSessionInfo: getCursorSessionInfo,
+    setActiveSession: setCursorActiveSession,
+    getLastSessionId: getCursorLastSessionId,
+    DEFAULT_WORKSPACE: CURSOR_DEFAULT_WORKSPACE,
+    CURSOR_BIN,
+    checkCursorAuth,
+    formatAuthStatusHtml,
+    captureCursorScreenshot,
+    buildSpawnEnv,
+    listCursorModels,
+    clearCursorModelsCache,
+} = cursorCtrl;
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_WORK_DIR = process.env.CLAUDE_WORK_DIR || process.env.HOME;
 const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT) || 900000;
 const CLAUDE_SKIP_PERMS = process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS === 'true';
 
+let CURSOR_WORK_DIR = process.env.CURSOR_WORK_DIR || CURSOR_DEFAULT_WORKSPACE;
+
+let _cursorAuthCache = { at: 0, auth: null };
+const CURSOR_AUTH_CACHE_MS = 60 * 1000;
+
+async function refreshCursorAuth(force = false) {
+    const now = Date.now();
+    if (!force && _cursorAuthCache.auth && now - _cursorAuthCache.at < CURSOR_AUTH_CACHE_MS) {
+        return _cursorAuthCache.auth;
+    }
+    const auth = await checkCursorAuth();
+    _cursorAuthCache = { at: now, auth };
+    return auth;
+}
+
+
 // Engine state — persists across restarts
 const ENGINE_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'engine.txt');
 function loadEngine() {
-    try { return fs.readFileSync(ENGINE_STATE_FILE, 'utf-8').trim() || 'antigravity'; }
-    catch { return 'antigravity'; }
+    try {
+        const e = fs.readFileSync(ENGINE_STATE_FILE, 'utf-8').trim() || 'antigravity';
+        if (['antigravity', 'claude', 'cursor'].includes(e)) return e;
+        return 'antigravity';
+    } catch { return 'antigravity'; }
 }
 function saveEngine(e) {
     try { fs.writeFileSync(ENGINE_STATE_FILE, e); } catch {}
 }
-let currentEngine = loadEngine(); // 'antigravity' | 'claude'
+let currentEngine = loadEngine(); // 'antigravity' | 'claude' | 'cursor'
+
+function engineLabel(e = currentEngine) {
+    if (e === 'claude') return 'Claude Code (CLI)';
+    if (e === 'cursor') return 'Cursor Agent (CLI)';
+    return 'Antigravity (CDP)';
+}
 
 const CLAUDE_MODEL_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'claude_model.txt');
 function loadClaudeModel() {
@@ -55,6 +112,157 @@ function saveClaudeModel(m) {
     try { fs.writeFileSync(CLAUDE_MODEL_STATE_FILE, m); } catch {}
 }
 let currentClaudeModel = loadClaudeModel();
+
+/** Claude model picker — full IDs from ~/.claude/settings.json models[], 1 page. */
+const CLAUDE_MODEL_MAX_BUTTONS = 90;
+const claudeModelPickByChat = new Map();
+
+function buildClaudeModelKeyboard(models, chatId) {
+    const list = Array.isArray(models) ? models.slice(0, CLAUDE_MODEL_MAX_BUTTONS) : [];
+    const total = models ? models.length : 0;
+    const truncated = total > list.length;
+    claudeModelPickByChat.set(String(chatId), list);
+
+    const rows = list.map((m, i) => {
+        const mark = currentClaudeModel === m.id ? '✅ ' : '';
+        const text = `${mark}${shortLabel(m.id, 60)}`;
+        return [Markup.button.callback(text, `cmd_i:${i}`)];
+    });
+    rows.push([
+        Markup.button.callback('🔄 Làm mới', 'cmd_refresh'),
+        Markup.button.callback('✏️ Gõ /model id', 'cmd_noop'),
+    ]);
+    return { keyboard: rows, total, truncated };
+}
+
+function formatClaudeModelPickerText(live, total, truncated) {
+    const src = (live && live.source) || '?';
+    const note = src === 'claude-settings-models'
+        ? 'List từ <code>~/.claude/settings.json</code> → <code>models[]</code> (ID + tiền tố).'
+        : 'Fallback — kiểm tra settings Claude Code rồi 🔄 Làm mới.';
+    return (
+        '🧠 <b>Chọn Model Claude Code</b>\n'
+        + `Nguồn: <code>${src}</code> · ${total} model${truncated ? ` (hiện ${CLAUDE_MODEL_MAX_BUTTONS})` : ''}.\n`
+        + `${note}\n`
+        + `Hiện tại: <code>${currentClaudeModel || 'haiku'}</code>`
+    );
+}
+
+const CURSOR_MODEL_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'cursor_model.txt');
+function loadCursorModel() {
+    try { return fs.readFileSync(CURSOR_MODEL_STATE_FILE, 'utf-8').trim() || 'auto'; }
+    catch { return 'auto'; }
+}
+function saveCursorModel(m) {
+    try { fs.writeFileSync(CURSOR_MODEL_STATE_FILE, m); } catch {}
+}
+let currentCursorModel = loadCursorModel();
+
+/**
+ * Cursor model picker — models currently ON in Cursor IDE (exact IDs + prefixes).
+ * Single page (no paging). Telegram soft cap ~90 model buttons + footer.
+ */
+const CURSOR_MODEL_MAX_BUTTONS = 90;
+// chatId -> last models snapshot (for crmd_i index callbacks)
+const cursorModelPickByChat = new Map();
+
+async function getCursorModels(force = false) {
+    const result = await listCursorModels({ force: !!force });
+    return result;
+}
+
+/**
+ * Build Cursor model picker keyboard — full list on 1 page.
+ * Button text = exact model id (gcli/grok-4.5, 9f/pro/..., …).
+ * @param {Array<{id:string,label?:string}>} models
+ * @param {string} chatId
+ */
+function buildCursorModelKeyboard(models, chatId) {
+    const list = Array.isArray(models) ? models.slice(0, CURSOR_MODEL_MAX_BUTTONS) : [];
+    const total = models ? models.length : 0;
+    const truncated = total > list.length;
+
+    cursorModelPickByChat.set(String(chatId), list);
+
+    const rows = list.map((m, i) => {
+        const mark = currentCursorModel === m.id ? '✅ ' : '';
+        // Keep full id with prefix; only soft-trim for Telegram button text limit (~64)
+        const text = `${mark}${shortLabel(m.id, 60)}`;
+        return [Markup.button.callback(text, `crmd_i:${i}`)];
+    });
+
+    rows.push([
+        Markup.button.callback('🔄 Làm mới', 'crmd_refresh'),
+        Markup.button.callback('✏️ Gõ /model id', 'crmd_noop'),
+    ]);
+    return { keyboard: rows, total, truncated };
+}
+
+function formatCursorModelPickerText(live, total, truncated) {
+    const src = (live && live.source) || '?';
+    const note = src === 'cursor-ide-enabled'
+        ? 'Chỉ model <b>đang bật</b> trên Cursor IDE (đúng ID + tiền tố).'
+        : 'Nguồn fallback CLI — bật/tắt model trong Cursor IDE rồi 🔄 Làm mới.';
+    return (
+        '🧠 <b>Chọn Model Cursor</b>\n'
+        + `Nguồn: <code>${src}</code> · ${total} model${truncated ? ` (hiện ${CURSOR_MODEL_MAX_BUTTONS})` : ''}.\n`
+        + `${note}\n`
+        + `Hiện tại: <code>${currentCursorModel || 'auto'}</code>`
+    );
+}
+
+function getCursorHelpMessage() {
+    return (
+        '💠 <b>Menu Cursor Agent (CLI)</b>\n\n'
+        + '<b>Nút bàn phím:</b>\n'
+        + '📁 <b>Workspace</b> — đổi thư mục làm việc (vd. nexmeOS)\n'
+        + '🧠 <b>Model</b> — chọn model (<code>agent --model</code>)\n'
+        + '📊 <b>Status</b> — model, session, vault lock, Auto\n'
+        + '📸 <b>Màn hình</b> — chụp cửa sổ Cursor / màn hình Mac\n'
+        + '🆕 <b>New session</b> — reset chat (tin sau = chat mới)\n'
+        + '🔎 <b>Ask mode</b> — read-only, không ghi vault (<code>/cursor_ask</code>)\n'
+        + '🚀 <b>Auto</b> — bật/tắt <code>--force</code> (tự chạy tool, không hỏi)\n'
+        + '🛠️ <b>Skills</b> — từ <code>~/.cursor/skills/</code>, gọi <code>!tên_skill</code>\n'
+        + '🔀 <b>Engine</b> — đổi Anti / Claude / Cursor\n'
+        + '⏹ <b>Stop</b> — huỷ request đang chạy\n\n'
+        + '<b>Cách gửi lệnh:</b>\n'
+        + '• Engine = Cursor → gõ plain text\n'
+        + '• <code>/cursor [prompt]</code> — agent (ghi vault + lock)\n'
+        + '• <code>/cursor_ask [câu hỏi]</code> — chỉ đọc/phân tích\n'
+        + '• Reply tin Cursor → tiếp session\n\n'
+        + '<i>Khác Anti Turbo?</i> Anti Turbo = council đa model (Claude plan → Gemini làm). '
+        + 'Cursor Auto = chỉ bật <code>--force</code> cho 1 agent CLI — không orchestration.'
+    );
+}
+
+const CURSOR_AUTO_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'cursor_auto_by_chat.json');
+function loadCursorAutoState() {
+    try {
+        if (fs.existsSync(CURSOR_AUTO_STATE_FILE)) {
+            return JSON.parse(fs.readFileSync(CURSOR_AUTO_STATE_FILE, 'utf-8'));
+        }
+    } catch (_) {}
+    return {};
+}
+function saveCursorAutoState(map) {
+    try { fs.writeFileSync(CURSOR_AUTO_STATE_FILE, JSON.stringify(map, null, 2)); } catch (_) {}
+}
+const cursorAutoByChat = loadCursorAutoState();
+
+function getCursorAuto(chatId) {
+    const id = String(chatId || '');
+    if (id && Object.prototype.hasOwnProperty.call(cursorAutoByChat, id)) {
+        return !!cursorAutoByChat[id];
+    }
+    return process.env.CURSOR_FORCE !== 'false';
+}
+
+function setCursorAuto(chatId, enabled) {
+    const id = String(chatId || '');
+    if (!id) return;
+    cursorAutoByChat[id] = !!enabled;
+    saveCursorAutoState(cursorAutoByChat);
+}
 
 const TURBO_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'turbo_state.json');
 const RESTART_FLAG_FILE = path.join(os.homedir(), '.gemini', 'antigravity', '.restart_pending');
@@ -141,10 +349,14 @@ if (ALLOWED_CHAT_IDS.length === 0) {
 }
 
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 900000 }); // 15 minutes timeout to allow long /ask requests
+const dailyLoop = createDailyLoop();
 
 startCronJobs(bot); // Khởi chạy finance cron jobs
 const { startBrain2Cron, isCronReply, buildCronContext, sendTestCron } = require('./brain2-cron');
-startBrain2Cron(bot); // Brain2 autonomous cron (03h/06h/09h/20h)
+startBrain2Cron(bot, dailyLoop); // Brain2 autonomous cron; Daily Loop replaces only flagged jobs
+
+const { startSkillTrackerCron } = require('./skill-tracker/cron');
+startSkillTrackerCron(bot);
 
 // /testcron — send a test Brain2 cron message for reply testing
 bot.command('testcron', async (ctx) => {
@@ -636,6 +848,21 @@ function checkAuth(ctx, next) {
 
 bot.use(checkAuth);
 
+require('./skill-tracker/commands').setupSkillTrackerCommands(bot);
+
+// Deterministic Daily Loop callbacks run before engine-specific actions.
+bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery && await dailyLoop.handleCallback(ctx)) return;
+    return next();
+});
+
+for (const command of ['task', 'cham', 'interaction', 'dongngay', 'tuan', 'focus']) {
+    bot.command(command, async (ctx) => {
+        const handled = await dailyLoop.handleText(ctx, ctx.message.text);
+        if (!handled) await ctx.reply('Daily Loop đang tắt.');
+    });
+}
+
 // ===== COMMANDS =====
 
 bot.start((ctx) => {
@@ -672,6 +899,10 @@ bot.command('restart', async (ctx) => {
 });
 
 bot.help((ctx) => {
+    const topic = (ctx.message.text || '').split(/\s+/).slice(1)[0]?.toLowerCase();
+    if (topic === 'cursor') {
+        return ctx.reply(getCursorHelpMessage(), { parse_mode: 'HTML' });
+    }
     const helpMessage = `
 ${t('help.title')}
 
@@ -804,6 +1035,25 @@ const handleStatus = async (ctx) => {
         msg += `⏳ Active Task: ${isSessionActive(String(ctx.chat.id)) ? 'Yes' : 'No'}\n`;
         return ctx.reply(msg, { parse_mode: 'HTML' });
     }
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        let msg = '📊 <b>Cursor Agent (CLI) Status</b>\n\n';
+        msg += `🧠 Model: <b>${currentCursorModel || 'auto'}</b>\n`;
+        msg += `🧰 Binary: <code>${CURSOR_BIN}</code>\n`;
+        msg += `📁 Workspace: <code>${CURSOR_WORK_DIR}</code>\n`;
+        const cInfo = getCursorSessionInfo(String(ctx.chat.id));
+        msg += `📋 Session: <code>${cInfo.sessionId ? cInfo.sessionId.slice(0, 8) + '...' : 'new'}</code>\n`;
+        msg += `⏳ Active Task: ${isCursorSessionActive(String(ctx.chat.id)) ? 'Yes' : 'No'}\n`;
+        msg += `🚀 Auto: <b>${getCursorAuto(ctx.chat.id) ? 'ON (--force)' : 'OFF'}</b>\n`;
+        const lock = cursorCtrl.checkVaultLock(CURSOR_WORK_DIR);
+        if (!lock.ok) {
+            msg += `🔒 Vault lock: <b>${lock.lockedBy}</b> (~${lock.ageMin}p)\n`;
+        } else {
+            msg += `🔓 Vault lock: free\n`;
+        }
+        const auth = await refreshCursorAuth();
+        msg += '\n' + formatAuthStatusHtml(auth);
+        return ctx.reply(msg, { parse_mode: 'HTML' });
+    }
     let msg = t('status.report_title');
     
     const agentCheck = await isIDERunning('agent');
@@ -846,12 +1096,19 @@ const handleStatus = async (ctx) => {
         }
     }
 
-    msg += '\n🔀 <b>Engine:</b> ' + (currentEngine === 'claude' ? 'Claude Code (CLI)' : 'Antigravity (CDP)') + '\n';
+    msg += '\n🔀 <b>Engine:</b> ' + engineLabel() + '\n';
     if (currentEngine === 'claude') {
         const cInfo = getSessionInfo(String(ctx.chat.id));
         msg += '🧠 <b>Model:</b> <code>' + (typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : 'claude-3-7-sonnet') + '</code>\n';
         msg += '📋 <b>Session:</b> <code>' + (cInfo.sessionId ? cInfo.sessionId.slice(0,8) + '...' : 'new') + '</code>\n';
         msg += '📁 <b>CWD:</b> <code>' + CLAUDE_WORK_DIR + '</code>\n';
+    }
+    if (currentEngine === 'cursor') {
+        const cInfo = getCursorSessionInfo(String(ctx.chat.id));
+        msg += `🧠 <b>Model:</b> <code>${currentCursorModel || 'auto'}</code>\n`;
+        msg += `🚀 <b>Auto:</b> ${getCursorAuto(ctx.chat.id) ? 'ON' : 'OFF'}\n`;
+        msg += '📋 <b>Session:</b> <code>' + (cInfo.sessionId ? cInfo.sessionId.slice(0,8) + '...' : 'new') + '</code>\n';
+        msg += '📁 <b>CWD:</b> <code>' + CURSOR_WORK_DIR + '</code>\n';
     }
     msg += '🛡️ <b>Auto-Accept:</b> ' + (autoaccept.isEnabled ? t('status.autoaccept_on') : t('status.autoaccept_off')) + '\n';
 
@@ -882,7 +1139,48 @@ async function getChatHeader(targetId = null, fallback = '') {
     return fallback;
 }
 
-async function buildMainMenu(overrideThread = null, overrideWorkspace = null, targetId = null) {
+function shortLabel(name, max = 20) {
+    const s = String(name || '').trim() || 'workspace';
+    return s.length > max ? s.substring(0, max - 2) + '...' : s;
+}
+
+function antiOnlyFeatureMsg() {
+    return t('feature.claude_unsupported')
+        || '❌ Tính năng này chỉ có trên Antigravity.\nDùng 🔀 Engine để chuyển, hoặc /panel để refresh menu.';
+}
+
+/**
+ * Reply keyboard theo engine — mỗi backend 1 layout riêng.
+ * Cursor/Claude KHÔNG nhận nút Anti (Turbo, Artifacts, Screen CDP, Gemini model, Skills An…).
+ */
+async function buildMainMenu(overrideThread = null, overrideWorkspace = null, targetId = null, chatId = null) {
+    // --- Cursor Agent (CLI) ---
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        const cwName = shortLabel(path.basename(CURSOR_WORK_DIR));
+        const modelShort = shortLabel(currentCursorModel || 'auto', 18);
+        const autoBtn = getCursorAuto(chatId) ? '🚀 Auto ✅' : '🚀 Auto';
+        return Markup.keyboard([
+            [`📁 ${cwName}`, `🧠 ${modelShort}`],
+            ['📊 Status', '📸 Màn hình'],
+            ['🆕 New session', '🔎 Ask mode'],
+            [autoBtn, '🛠️ Skills'],
+            ['🔀 Engine', '⏹ Stop']
+        ]).resize();
+    }
+
+    // --- Claude Code (CLI) ---
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        const cwDir = process.env.CLAUDE_WORK_DIR || process.env.HOME;
+        const cwName = shortLabel(path.basename(cwDir));
+        const modelShort = shortLabel(currentClaudeModel || 'Model', 18);
+        return Markup.keyboard([
+            [`📁 ${cwName}`, `🧠 ${modelShort}`],
+            ['📋 Session', '📊 Status'],
+            ['🔀 Engine', '⏹ Stop']
+        ]).resize();
+    }
+
+    // --- Antigravity (CDP) ---
     const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
     const isIDE = preferredApp === 'ide';
     let wsName = overrideWorkspace || 'Projects';
@@ -932,20 +1230,6 @@ async function buildMainMenu(overrideThread = null, overrideWorkspace = null, ta
     // Başlığı max 20 karaktere kısalt
     if (displayTitle.length > 20) displayTitle = displayTitle.substring(0, 18) + '...';
 
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        const cwDir = process.env.CLAUDE_WORK_DIR || process.env.HOME;
-        let cwName = require('path').basename(cwDir);
-        if (cwName.length > 20) cwName = cwName.substring(0, 18) + '...';
-        return Markup.keyboard([
-            [`📁 ${cwName}`, '🧠 Model'],
-            ['📋 Session', '🔀 Engine'],
-            [
-                isTurboMode ? (t('turbo.btn_on') || '🚀 Turbo ✅') : (t('turbo.btn_off') || '🚀 Turbo'), 
-                t('btn_skills') || '🛠️ Skills'
-            ]
-        ]).resize();
-    }
-
     return Markup.keyboard([
         [`🤖 ${displayTitle}`, `🧠 ${modelName}`],
         [
@@ -961,28 +1245,38 @@ async function buildMainMenu(overrideThread = null, overrideWorkspace = null, ta
     ]).resize();
 }
 
+/**
+ * Push main menu. ReplyKeyboardMarkup CHỈ gắn được qua sendMessage —
+ * editMessageText không đổi bottom keyboard (Telegram API). Khi callback
+ * (đổi Engine…): edit text (bỏ inline) rồi reply kèm keyboard mới.
+ */
 async function sendMainMenu(ctx, text = '🕹️ Kontrol Paneli:', overrideThread = null, overrideWorkspace = null, targetId = null, editMessageId = null) {
-    const kb = await buildMainMenu(overrideThread, overrideWorkspace, targetId);
-    
+    const kb = await buildMainMenu(overrideThread, overrideWorkspace, targetId, ctx.chat?.id);
+    const replyOpts = { parse_mode: 'HTML', ...kb };
+
     if (editMessageId) {
-        // We do NOT pass kb here because kb contains a ReplyKeyboardMarkup, which Telegram API 
-        // rejects for editMessageText (it expects InlineKeyboardMarkup or none).
-        return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, text, { parse_mode: 'HTML' }).catch(e => {
+        await ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, text, { parse_mode: 'HTML' }).catch(e => {
             console.error('[sendMainMenu] editMessageText failed:', e.message);
-            if (!e.message.includes('message is not modified')) {
-                return ctx.reply(text, kb);
-            }
         });
+        return ctx.reply(text, replyOpts);
     }
 
     if (ctx.callbackQuery && ctx.callbackQuery.message) {
-        return ctx.editMessageText(text, kb).catch(e => {
-            if (!e.message.includes('message is not modified')) {
-                return ctx.reply(text, kb);
+        // Update confirmation message without trying to attach ReplyKeyboard (invalid on edit).
+        await ctx.editMessageText(text, { parse_mode: 'HTML' }).catch(e => {
+            if (!String(e.message || '').includes('message is not modified')) {
+                console.error('[sendMainMenu] callback edit failed:', e.message);
             }
         });
+        // Fresh sendMessage is required so Telegram refreshes the bottom reply keyboard.
+        const engineHint = currentEngine === 'cursor'
+            ? '⌨️ Menu <b>Cursor</b> đã cập nhật.\n<i>Gõ /help cursor để xem giải thích từng nút.</i>'
+            : currentEngine === 'claude'
+                ? '⌨️ Menu <b>Claude Code</b> đã cập nhật.'
+                : '⌨️ Menu <b>Antigravity</b> đã cập nhật.';
+        return ctx.reply(engineHint, replyOpts);
     }
-    return ctx.reply(text, kb);
+    return ctx.reply(text, replyOpts);
 }
 
 async function pushMainMenuToUser(text, silent = false) {
@@ -996,8 +1290,8 @@ bot.command('start', async (ctx) => {
 });
 
 const handleLatest = async (ctx) => {
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
+        return ctx.reply(antiOnlyFeatureMsg());
     }
     try {
         // Use the preferred target (set by workspace switch or /window command)
@@ -1018,8 +1312,24 @@ bot.command('latest', handleLatest);
 bot.hears(/^💬/i, handleLatest);
 
 const handleScreenshot = async (ctx) => {
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        try {
+            setReaction(ctx, REACTION.THINKING);
+            await ctx.reply('📸 Đang chụp cửa sổ Cursor / màn hình Mac...');
+            const { buffer, source } = await captureCursorScreenshot();
+            await ctx.replyWithPhoto(
+                { source: buffer },
+                { caption: `📸 ${source}\n<i>Không phải CDP DOM như Anti — cần app Cursor mở hoặc quyền Screen Recording.</i>`, parse_mode: 'HTML' }
+            );
+            setReaction(ctx, null);
+        } catch (err) {
+            setReaction(ctx, null);
+            ctx.reply(`❌ Chụp màn hình thất bại: ${err.message}`);
+        }
+        return;
+    }
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
+        return ctx.reply('📸 Chụp màn hình: dùng engine <b>Cursor</b> hoặc <b>Antigravity</b>.', { parse_mode: 'HTML' });
     }
     try {
         setReaction(ctx, REACTION.THINKING);
@@ -1116,6 +1426,10 @@ bot.command('stop', async (ctx) => {
         const cancelled = cancelSession(String(ctx.chat.id));
         return ctx.reply(cancelled ? '⏹ Claude request cancelled.' : 'ℹ️ Nothing running.');
     }
+    if (currentEngine === 'cursor') {
+        const cancelled = cancelCursorSession(String(ctx.chat.id));
+        return ctx.reply(cancelled ? '⏹ Cursor request cancelled.' : 'ℹ️ Nothing running.');
+    }
     try {
         setReaction(ctx, REACTION.THINKING);
         const stopped = await stopAgent(CDP_PORT);
@@ -1141,12 +1455,60 @@ const handleEngine = async (ctx) => {
             [Markup.button.callback(
                 (currentEngine === 'claude' ? '👉 ' : '') + 'Claude Code (CLI)',
                 'engine_claude'
+            )],
+            [Markup.button.callback(
+                (currentEngine === 'cursor' ? '👉 ' : '') + 'Cursor Agent (CLI)',
+                'engine_cursor'
             )]
         ])
     });
 };
 bot.command('engine', handleEngine);
 bot.hears(/^🔀/i, handleEngine);
+
+// Cursor/Claude reply-keyboard handlers
+bot.hears(/^📊\s*Status$/i, handleStatus);
+bot.hears(/^⏹\s*Stop$/i, async (ctx) => {
+    // reuse /stop handler by synthesizing command path
+    if (currentEngine === 'claude') {
+        const cancelled = cancelSession(String(ctx.chat.id));
+        return ctx.reply(cancelled ? '⏹ Claude request cancelled.' : 'ℹ️ Nothing running.');
+    }
+    if (currentEngine === 'cursor') {
+        const cancelled = cancelCursorSession(String(ctx.chat.id));
+        return ctx.reply(cancelled ? '⏹ Cursor request cancelled.' : 'ℹ️ Nothing running.');
+    }
+    try {
+        setReaction(ctx, REACTION.THINKING);
+        const stopped = await stopAgent(CDP_PORT);
+        ctx.reply(stopped ? t('stop.stopped') : t('stop.already_stopped'));
+    } catch (e) {
+        ctx.reply(t('stop.error', { error: e.message }));
+    }
+});
+bot.hears(/^🆕/i, async (ctx) => {
+    if (currentEngine === 'cursor') {
+        resetCursorSession(String(ctx.chat.id));
+        return sendMainMenu(ctx, '🆕 Cursor session reset.\nTin nhắn tiếp theo tạo chat mới.');
+    }
+    if (currentEngine === 'claude') {
+        resetSession(String(ctx.chat.id));
+        return sendMainMenu(ctx, '🆕 Claude session reset.\nTin nhắn tiếp theo tạo chat mới.');
+    }
+    return ctx.reply(antiOnlyFeatureMsg());
+});
+bot.hears(/^🔎/i, async (ctx) => {
+    if (currentEngine !== 'cursor') {
+        return ctx.reply('🔎 Ask mode chỉ dùng với Cursor.\nGõ <code>/cursor_ask [câu hỏi]</code>', { parse_mode: 'HTML' });
+    }
+    return ctx.reply(
+        '🔎 <b>Ask mode (Cursor read-only)</b>\n\n'
+        + 'Gõ: <code>/cursor_ask [câu hỏi]</code>\n'
+        + '→ không ghi vault, không lấy <code>.nexmeos-lock</code>.\n\n'
+        + 'Agent ghi vault: plain text (engine Cursor) hoặc <code>/cursor …</code>.',
+        { parse_mode: 'HTML' }
+    );
+});
 
 bot.action('engine_antigravity', async (ctx) => {
     currentEngine = 'antigravity';
@@ -1160,6 +1522,18 @@ bot.action('engine_claude', async (ctx) => {
     saveEngine('claude');
     ctx.answerCbQuery('Switched to Claude Code');
     await sendMainMenu(ctx, '🔀 Engine: <b>Claude Code (CLI)</b> ✅');
+});
+
+bot.action('engine_cursor', async (ctx) => {
+    currentEngine = 'cursor';
+    saveEngine('cursor');
+    ctx.answerCbQuery('Switched to Cursor');
+    await sendMainMenu(ctx,
+        '🔀 Engine: <b>Cursor Agent (CLI)</b> ✅\n'
+        + `📁 <code>${CURSOR_WORK_DIR}</code>\n`
+        + `🧠 Model: <code>${currentCursorModel || 'auto'}</code>\n\n`
+        + '<i>Gõ /help cursor để xem giải thích menu.</i>'
+    );
 });
 
 // ===== CLAUDE CODE QUERY HANDLER =====
@@ -1236,6 +1610,112 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
         ctx.reply(`❌ ${err.message}`);
     }
 }
+
+// ===== CURSOR AGENT QUERY HANDLER =====
+async function handleCursorQuery(ctx, query, explicitSessionId = null, mode = null) {
+    const chatId = String(ctx.chat.id);
+    if (isCursorSessionActive(chatId)) {
+        return ctx.reply('⏳ Cursor đang xử lý. /stop để huỷ.');
+    }
+
+    setReaction(ctx, REACTION.THINKING);
+    const typingInterval = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
+    const modeLabel = mode === 'ask' ? ' (ask/RO)' : mode === 'plan' ? ' (plan)' : '';
+    let statusMsg = await ctx.reply(`⏳ Cursor đang xử lý${modeLabel}...`, { parse_mode: 'HTML' });
+    let lastStatus = '';
+    let toolCount = 0;
+
+    try {
+        let sessionId = explicitSessionId || getCursorLastSessionId(chatId);
+
+        const result = await sendToCursor(query, {
+            chatId,
+            workDir: CURSOR_WORK_DIR,
+            model: currentCursorModel && currentCursorModel !== 'auto' ? currentCursorModel : undefined,
+            force: getCursorAuto(chatId),
+            resumeSessionId: sessionId || undefined,
+            mode: mode || undefined,
+            onEvent: (event) => {
+                let newStatus = null;
+                if (event.type === 'system' && event.subtype === 'init') {
+                    newStatus = `🔌 Cursor connected${event.model ? ` · ${event.model}` : ''}`;
+                } else if (event.type === 'tool_call' && event.subtype === 'started') {
+                    toolCount++;
+                    const label = Object.keys(event.tool_call || {})[0] || 'tool';
+                    const args = event.tool_call?.[label]?.args || {};
+                    let detail = '';
+                    if (args.path) detail = `: ${path.basename(args.path)}`;
+                    else if (args.command) detail = `: ${String(args.command).slice(0, 40)}`;
+                    newStatus = `🛠 [${toolCount}] ${label.replace(/ToolCall$/, '')}${detail}`;
+                }
+                if (newStatus && newStatus !== lastStatus) {
+                    lastStatus = newStatus;
+                    ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, newStatus)
+                        .catch(() => {});
+                }
+            }
+        });
+
+        clearInterval(typingInterval);
+        ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+        setReaction(ctx, null);
+
+        if (!result.text) return ctx.reply('⚠️ Response rỗng.');
+
+        const footer = `\n\n⏱ ${(result.duration / 1000).toFixed(1)}s` +
+            (result.toolsUsed.length ? ` | 🛠 ${result.toolsUsed.slice(0, 8).join(', ')}` : '');
+
+        const sentIds = await sendLongMessage(ctx, result.text + footer, '💠 Cursor Agent');
+        if (sentIds && sentIds.length > 0 && result.sessionId) {
+            sentIds.forEach(id => messageTargetMap.set(id, { cursorSessionId: result.sessionId }));
+            saveMessageTargetMap(messageTargetMap);
+        }
+    } catch (err) {
+        clearInterval(typingInterval);
+        ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+        setReaction(ctx, null);
+        console.error(`❌ Cursor [${chatId}]:`, err.message);
+        ctx.reply(`❌ ${err.message}`);
+    }
+}
+
+bot.command('cursor', async (ctx) => {
+    const text = (ctx.message.text || '').replace(/^\/cursor(@\w+)?\s*/i, '').trim();
+    if (!text) {
+        return ctx.reply(
+            '💠 <b>Cursor Agent</b>\n' +
+            `📁 <code>${CURSOR_WORK_DIR}</code>\n` +
+            `🧠 Model: <code>${currentCursorModel || 'auto'}</code>\n` +
+            `🚀 Auto: <b>${getCursorAuto(ctx.chat.id) ? 'ON' : 'OFF'}</b>\n` +
+            `🧰 <code>${CURSOR_BIN}</code>\n\n` +
+            'Cách dùng:\n' +
+            '• <code>/cursor [prompt]</code> — agent (có ghi vault + lock)\n' +
+            '• <code>/cursor_ask [prompt]</code> — read-only\n' +
+            '• <code>/cursor_auto</code> — bật/tắt Auto (--force)\n' +
+            '• <code>/help cursor</code> — giải thích menu\n' +
+            '• <code>/engine</code> → chọn Cursor → mọi text đi Cursor\n' +
+            '• Reply tin Cursor để resume session\n\n' +
+            ((await refreshCursorAuth()).ok
+                ? '🔐 Auth: OK — chi tiết: /status'
+                : '🔐 Auth FAIL — thêm CURSOR_API_KEY vào .env hoặc chạy agent login'),
+            { parse_mode: 'HTML' }
+        );
+    }
+    return handleCursorQuery(ctx, text, null, null);
+});
+
+bot.command('cursor_ask', async (ctx) => {
+    const text = (ctx.message.text || '').replace(/^\/cursor_ask(@\w+)?\s*/i, '').trim();
+    if (!text) {
+        return ctx.reply('Dùng: <code>/cursor_ask [câu hỏi]</code> — Cursor read-only, không ghi vault.', { parse_mode: 'HTML' });
+    }
+    return handleCursorQuery(ctx, text, null, 'ask');
+});
+
+bot.command('cursor_new', async (ctx) => {
+    resetCursorSession(String(ctx.chat.id));
+    ctx.reply('🆕 Cursor session reset. Tin nhắn tiếp theo tạo chat mới.');
+});
 
 // ===== CLAUDE SESSION PICKER =====
 const handleSession = async (ctx) => {
@@ -1535,31 +2015,36 @@ bot.action(/^sch_del_(.+)$/, async (ctx) => {
     }
 });
 
-// Helper to get all available skills from ~/.gemini/config/skills
-function getAvailableSkills() {
-    const skillsDir = path.join(os.homedir(), '.gemini', 'config', 'skills');
-    if (!fs.existsSync(skillsDir)) return [];
-    
-    try {
-        const items = fs.readdirSync(skillsDir, { withFileTypes: true });
-        return items
-            .filter(item => item.isDirectory())
-            .map(item => item.name)
-            .filter(name => {
-                // Ensure SKILL.md exists in the folder
-                return fs.existsSync(path.join(skillsDir, name, 'SKILL.md'));
-            });
-    } catch (e) {
-        console.error('Error reading skills directory:', e.message);
-        return [];
+// Helper to get all available skills from engine-specific dirs
+function getAvailableSkills(engine = currentEngine) {
+    const dirs = engine === 'cursor'
+        ? [
+            path.join(os.homedir(), '.cursor', 'skills'),
+            path.join(os.homedir(), '.gemini', 'config', 'skills'),
+        ]
+        : [path.join(os.homedir(), '.gemini', 'config', 'skills')];
+    const names = new Set();
+    for (const skillsDir of dirs) {
+        if (!fs.existsSync(skillsDir)) continue;
+        try {
+            const items = fs.readdirSync(skillsDir, { withFileTypes: true });
+            for (const item of items) {
+                if (!item.isDirectory()) continue;
+                const name = item.name;
+                if (fs.existsSync(path.join(skillsDir, name, 'SKILL.md'))) names.add(name);
+            }
+        } catch (e) {
+            console.error('Error reading skills directory:', e.message);
+        }
     }
+    return [...names].sort();
 }
 
 async function handleListSkills(ctx, pageIndex = 0) {
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+        return ctx.reply('🛠️ Skills list chỉ có trên Antigravity và Cursor.\nGọi skill bằng <code>!tên_skill</code> vẫn hoạt động.', { parse_mode: 'HTML' });
     }
-    const skills = getAvailableSkills();
+    const skills = getAvailableSkills(currentEngine);
     if (skills.length === 0) {
         return ctx.reply(t('skills.empty') || 'No skills found.');
     }
@@ -1612,8 +2097,12 @@ async function handleListSkills(ctx, pageIndex = 0) {
 }
 
 async function handleSkillInfo(ctx, skillName, returnPage) {
-    const skillsDir = path.join(os.homedir(), '.gemini', 'config', 'skills');
-    const skillMdPath = path.join(skillsDir, skillName, 'SKILL.md');
+    const skillDirs = [
+        path.join(os.homedir(), '.cursor', 'skills', skillName),
+        path.join(os.homedir(), '.gemini', 'config', 'skills', skillName),
+    ];
+    const skillMdPath = skillDirs.map((d) => path.join(d, 'SKILL.md')).find((p) => fs.existsSync(p))
+        || path.join(os.homedir(), '.gemini', 'config', 'skills', skillName, 'SKILL.md');
     
     let description = '';
     if (fs.existsSync(skillMdPath)) {
@@ -1791,8 +2280,8 @@ bot.hears(/^\/agents_(\d+)$/, async (ctx) => {
 });
 
 const handleArtifacts = async (ctx) => {
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
+        return ctx.reply(antiOnlyFeatureMsg());
     }
     try {
         const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
@@ -2008,6 +2497,50 @@ bot.hears(/^\/artifact_(\d+)$/, async (ctx) => {
 });
 
 const handleModel = async (ctx) => {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        let modelName = '';
+        if (ctx.message && ctx.message.text) {
+            const parts = ctx.message.text.split(' ');
+            if (parts[0].startsWith('/')) parts.shift();
+            modelName = parts.join(' ').trim();
+            if (modelName.startsWith('🧠') || modelName.startsWith('🤖') || modelName.toLowerCase().startsWith('model:')) {
+                const fromButton = modelName.replace(/^🧠\s*/, '').trim();
+                const isMenuLabel = !fromButton
+                    || fromButton === currentCursorModel
+                    || fromButton === shortLabel(currentCursorModel || 'auto', 18);
+                modelName = isMenuLabel ? '' : fromButton;
+            }
+        }
+
+        if (modelName && modelName !== (currentCursorModel || 'auto')) {
+            // Prefer live list when available; still allow typed id (CLI accepts --model).
+            currentCursorModel = modelName;
+            saveCursorModel(modelName);
+            await sendMainMenu(ctx, `🧠 Model Cursor: <b>${modelName}</b> ✅`);
+            return;
+        }
+
+        const live = await getCursorModels(false);
+        const models = live.models || [];
+        if (!models.length || live.source === 'fallback') {
+            return ctx.reply(
+                '🧠 <b>Chọn Model Cursor</b>\n'
+                + '⚠️ Không lấy được danh sách model đang bật trên Cursor IDE.\n'
+                + (live.error ? `Chi tiết: <code>${live.error}</code>\n` : '')
+                + 'Mở Cursor → bật model cần dùng → 🔄 Làm mới.\n'
+                + 'Hoặc gõ: <code>/model [id]</code> (vd. <code>/model gcli/grok-4.5</code>).\n'
+                + `Hiện tại: <code>${currentCursorModel || 'auto'}</code>`,
+                { parse_mode: 'HTML' }
+            );
+        }
+
+        const chatId = String(ctx.chat.id);
+        const { keyboard, total, truncated } = buildCursorModelKeyboard(models, chatId);
+        return ctx.reply(
+            formatCursorModelPickerText(live, total, truncated),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+        );
+    }
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
         let modelName = '';
         if (ctx.message && ctx.message.text) {
@@ -2016,32 +2549,33 @@ const handleModel = async (ctx) => {
             modelName = parts.join(' ').trim();
             if (modelName.startsWith('🧠') || modelName.startsWith('🤖') || modelName.toLowerCase().startsWith('model:')) modelName = '';
         }
-        
+
         if (modelName) {
             currentClaudeModel = modelName;
             saveClaudeModel(modelName);
-            ctx.reply(`✅ Đã đổi model Claude Code thành: <b>${modelName}</b>`, { parse_mode: 'HTML' });
+            await sendMainMenu(ctx, `🧠 Model Claude Code: <b>${modelName}</b> ✅`);
             return;
         }
 
-        const models = [
-            { label: '⚡ claude-haiku-4-5 (nhanh, rẻ)', value: 'haiku' },
-            { label: '🧠 claude-sonnet-4-6 (cân bằng)', value: 'sonnet' },
-            { label: '🔥 claude-opus-4-8 (mạnh nhất)', value: 'opus' },
-            { label: '🧠 claude-sonnet-4-6 (full ID)', value: 'claude-sonnet-4-6' },
-            { label: '🔥 claude-opus-4-8 (full ID)', value: 'claude-opus-4-8' },
-        ];
+        const live = await listClaudeModels({ force: false });
+        const models = live.models || [];
+        if (!models.length) {
+            return ctx.reply(
+                '🧠 <b>Chọn Model Claude Code</b>\n'
+                + '⚠️ Không đọc được <code>models[]</code> trong settings.\n'
+                + (live.error ? `Chi tiết: <code>${live.error}</code>\n` : '')
+                + 'Gõ: <code>/model [id]</code> (vd. <code>/model kr/claude-sonnet-4.6</code>).\n'
+                + `Hiện tại: <code>${currentClaudeModel || 'haiku'}</code>`,
+                { parse_mode: 'HTML' }
+            );
+        }
 
-        const buttons = models.map(m => {
-            const cbData = 'cmd_' + Buffer.from(m.value).toString('base64').slice(0, 58);
-            return [{ text: `${m.label}${currentClaudeModel === m.value ? ' ✅' : ''}`, callback_data: cbData }];
-        });
-        
-        ctx.reply('🧠 <b>Chọn Model cho Claude Code:</b>\nHoặc gõ <code>/model [tên_model]</code> để đổi sang model khác.', {
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: buttons }
-        });
-        return;
+        const chatId = String(ctx.chat.id);
+        const { keyboard, total, truncated } = buildClaudeModelKeyboard(models, chatId);
+        return ctx.reply(
+            formatClaudeModelPickerText(live, total, truncated),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+        );
     }
 
     let modelName = '';
@@ -2097,6 +2631,9 @@ bot.command('model', handleModel);
 
 bot.action(/^md_(.+)/, async (ctx) => {
     try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
+            return ctx.answerCbQuery('Chỉ Antigravity', { show_alert: true });
+        }
         const modelName = Buffer.from(ctx.match[1], 'base64').toString('utf-8');
         ctx.answerCbQuery(modelName);
         const changingText = t('model.changing', { model: modelName });
@@ -2113,17 +2650,192 @@ bot.action(/^md_(.+)/, async (ctx) => {
     }
 });
 
-bot.action(/^cmd_(.+)/, async (ctx) => {
+bot.action('cmd_noop', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (_) {}
+});
+
+bot.action('cmd_refresh', async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'claude') {
+            return ctx.answerCbQuery('Chỉ Claude Code engine', { show_alert: true });
+        }
+        clearClaudeModelsCache();
+        const live = await listClaudeModels({ force: true });
+        const models = live.models || [];
+        if (!models.length) {
+            return ctx.answerCbQuery('Không lấy được list model', { show_alert: true });
+        }
+        const chatId = String(ctx.chat.id);
+        const { keyboard, total, truncated } = buildClaudeModelKeyboard(models, chatId);
+        await ctx.answerCbQuery(`Đã làm mới · ${total} model`);
+        await ctx.editMessageText(
+            formatClaudeModelPickerText(live, total, truncated),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+        ).catch(() => {});
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi refresh'); } catch (_) {}
+    }
+});
+
+bot.action(/^cmd_i:(\d+)$/, async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'claude') {
+            return ctx.answerCbQuery('Chỉ Claude Code engine', { show_alert: true });
+        }
+        const idx = parseInt(ctx.match[1], 10);
+        const chatId = String(ctx.chat.id);
+        let models = claudeModelPickByChat.get(chatId);
+        if (!models || !models.length) {
+            const live = await listClaudeModels({ force: false });
+            models = (live.models || []).slice(0, CLAUDE_MODEL_MAX_BUTTONS);
+            claudeModelPickByChat.set(chatId, models);
+        }
+        const picked = models[idx];
+        if (!picked || !picked.id) {
+            return ctx.answerCbQuery('Model không còn trong list — bấm Làm mới', { show_alert: true });
+        }
+        currentClaudeModel = picked.id;
+        saveClaudeModel(picked.id);
+        await ctx.answerCbQuery(picked.id);
+        await sendMainMenu(ctx, `🧠 Model Claude Code: <b>${picked.id}</b> ✅`);
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi model'); } catch (_) {}
+        ctx.reply(`❌ ${e.message}`).catch(() => {});
+    }
+});
+
+// Legacy base64 callback (old Claude model messages)
+bot.action(/^cmd_(?!i:|refresh|noop)(.+)/, async (ctx) => {
     try {
         const modelName = Buffer.from(ctx.match[1], 'base64').toString('utf-8');
-        ctx.answerCbQuery(modelName);
+        if (!modelName || modelName.length > 120) {
+            return ctx.answerCbQuery('ID không hợp lệ — mở /model lại', { show_alert: true });
+        }
         currentClaudeModel = modelName;
         saveClaudeModel(modelName);
+        await ctx.answerCbQuery(modelName);
         await sendMainMenu(ctx, `🧠 Model Claude Code: <b>${modelName}</b> ✅`);
     } catch (e) {
         ctx.reply(`❌ ${e.message}`);
     }
 });
+
+bot.action('crmd_noop', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (_) {}
+});
+
+bot.action('crmd_refresh', async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'cursor') {
+            return ctx.answerCbQuery('Chỉ Cursor engine', { show_alert: true });
+        }
+        clearCursorModelsCache();
+        const live = await getCursorModels(true);
+        const models = live.models || [];
+        if (!models.length || live.source === 'fallback') {
+            await ctx.answerCbQuery('Không lấy được list model bật', { show_alert: true });
+            return;
+        }
+        const chatId = String(ctx.chat.id);
+        const { keyboard, total, truncated } = buildCursorModelKeyboard(models, chatId);
+        await ctx.answerCbQuery(`Đã làm mới · ${total} model`);
+        await ctx.editMessageText(
+            formatCursorModelPickerText(live, total, truncated),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+        ).catch(() => {});
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi refresh'); } catch (_) {}
+    }
+});
+
+// Legacy page callbacks — refresh full single-page list (no paging anymore)
+bot.action(/^crmd_p:(\d+)$/, async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'cursor') {
+            return ctx.answerCbQuery('Chỉ Cursor engine', { show_alert: true });
+        }
+        clearCursorModelsCache();
+        const live = await getCursorModels(true);
+        const models = live.models || [];
+        if (!models.length) {
+            return ctx.answerCbQuery('List rỗng — bấm Làm mới', { show_alert: true });
+        }
+        const chatId = String(ctx.chat.id);
+        const { keyboard, total, truncated } = buildCursorModelKeyboard(models, chatId);
+        await ctx.answerCbQuery('1 trang — full list');
+        await ctx.editMessageText(
+            formatCursorModelPickerText(live, total, truncated),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+        ).catch(() => {});
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi trang'); } catch (_) {}
+    }
+});
+
+bot.action(/^crmd_i:(\d+)$/, async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'cursor') {
+            return ctx.answerCbQuery('Chỉ Cursor engine', { show_alert: true });
+        }
+        const idx = parseInt(ctx.match[1], 10);
+        const chatId = String(ctx.chat.id);
+        let models = cursorModelPickByChat.get(chatId);
+        if (!models || !models.length) {
+            const live = await getCursorModels(false);
+            models = (live.models || []).slice(0, CURSOR_MODEL_MAX_BUTTONS);
+            cursorModelPickByChat.set(chatId, models);
+        }
+        const picked = models[idx];
+        if (!picked || !picked.id) {
+            return ctx.answerCbQuery('Model không còn trong list — bấm Làm mới', { show_alert: true });
+        }
+        currentCursorModel = picked.id;
+        saveCursorModel(picked.id);
+        await ctx.answerCbQuery(picked.id);
+        await sendMainMenu(ctx, `🧠 Model Cursor: <b>${picked.id}</b> ✅`);
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi model'); } catch (_) {}
+        ctx.reply(`❌ ${e.message}`).catch(() => {});
+    }
+});
+
+// Legacy base64 callback (old messages) — still accept if valid
+bot.action(/^crmd_(?!i:|p:|refresh|noop)(.+)/, async (ctx) => {
+    try {
+        if (typeof currentEngine !== 'undefined' && currentEngine !== 'cursor') {
+            return ctx.answerCbQuery('Chỉ Cursor engine', { show_alert: true });
+        }
+        const modelName = Buffer.from(ctx.match[1], 'base64').toString('utf-8');
+        if (!modelName || modelName.length > 120) {
+            return ctx.answerCbQuery('ID không hợp lệ — mở /model lại', { show_alert: true });
+        }
+        currentCursorModel = modelName;
+        saveCursorModel(modelName);
+        await ctx.answerCbQuery(modelName);
+        await sendMainMenu(ctx, `🧠 Model Cursor: <b>${modelName}</b> ✅`);
+    } catch (e) {
+        try { await ctx.answerCbQuery('Lỗi model'); } catch (_) {}
+        ctx.reply(`❌ ${e.message}`).catch(() => {});
+    }
+});
+
+// ===== CURSOR AUTO MODE =====
+
+async function handleCursorAuto(ctx) {
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'cursor') {
+        return ctx.reply('🚀 Auto chỉ dùng với engine <b>Cursor</b>.\nDùng 🔀 Engine để chuyển.', { parse_mode: 'HTML' });
+    }
+    const chatId = String(ctx.chat.id);
+    const next = !getCursorAuto(chatId);
+    setCursorAuto(chatId, next);
+    const msg = next
+        ? '🚀 <b>Cursor Auto ON</b>\nAgent chạy <code>--force</code>: tự thực thi ghi file / shell, không hỏi xác nhận.'
+        : '🚀 <b>Cursor Auto OFF</b>\nAgent cẩn thận hơn — có thể dừng chờ xác nhận tool (headless vẫn dùng <code>--trust</code>).';
+    await sendMainMenu(ctx, msg);
+}
+
+bot.command('cursor_auto', handleCursorAuto);
+bot.hears(/^🚀\s*Auto/i, handleCursorAuto);
 
 // ===== AUTO-ACCEPT =====
 
@@ -2365,18 +3077,18 @@ async function doLaunchWorkspace(ctx, workspace) {
                 }
             }
             if (cdpReady) {
+                // Clear preferred window BEFORE building the main menu 
+                // so that getActiveThreadInfo correctly uses the new activeWorkspaceName
+                setPreferredWindow(null);
+                
                 const successMsg = t('workspace.started', { workspace });
                 if (switchingMsg && switchingMsg.message_id) {
                     ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
                 }
                 await sendMainMenu(ctx, successMsg);
-                // trustWorkspaceViaCDP removed — CDP intervention during startup
-                // interrupts Electron's init/sync and prevents state.vscdb from saving
-                
-                // Clear preferred window when workspace changes
-                setPreferredWindow(null);
                 
                 // Re-inject autoaccept into the new window immediately
+
                 if (autoaccept.isEnabled) {
                     autoaccept.enable(CDP_PORT).catch(() => {});
                 }
@@ -2451,6 +3163,14 @@ const handleWorkspace = (ctx) => {
         sendMainMenu(ctx, `Thư mục hiện tại: <b>${path.basename(wsPath)}</b>`);
         return;
     }
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        CURSOR_WORK_DIR = wsPath;
+        updateEnvFile('CURSOR_WORK_DIR', wsPath);
+        resetCursorSession(String(ctx.chat.id));
+        ctx.reply(`✅ Đã chuyển workspace Cursor sang:\n<code>${wsPath}</code>\n\n(Session Cursor đã reset)`, { parse_mode: 'HTML' });
+        sendMainMenu(ctx, `Cursor CWD: <b>${path.basename(wsPath)}</b>`);
+        return;
+    }
     doLaunchWorkspace(ctx, wsPath);
 };
 bot.command('workspace', handleWorkspace);
@@ -2471,6 +3191,19 @@ bot.action(/ws_(.+)/, (ctx) => {
             ctx.reply(msg, { parse_mode: 'HTML' });
         }
         sendMainMenu(ctx, `Thư mục hiện tại: <b>${project}</b>`);
+        return;
+    }
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        CURSOR_WORK_DIR = wsPath;
+        updateEnvFile('CURSOR_WORK_DIR', wsPath);
+        resetCursorSession(String(ctx.chat.id));
+        let msg = `✅ Đã chuyển workspace Cursor sang:\n<code>${wsPath}</code>\n\n(Session Cursor đã reset)`;
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            ctx.editMessageText(msg, { parse_mode: 'HTML' }).catch(()=>{});
+        } else {
+            ctx.reply(msg, { parse_mode: 'HTML' });
+        }
+        sendMainMenu(ctx, `Cursor CWD: <b>${project}</b>`);
         return;
     }
     doLaunchWorkspace(ctx, wsPath);
@@ -3208,7 +3941,10 @@ bot.command('update', async (ctx) => {
 // ===== TURBO / COUNCIL MODE =====
 
 async function handleTurbo(ctx) {
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        return handleCursorAuto(ctx);
+    }
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
         return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
     }
     isTurboMode = !isTurboMode; // Toggle
@@ -3258,7 +3994,10 @@ bot.command('panel', async (ctx) => {
 });
 
 bot.hears(/^🤖/i, async (ctx) => {
-    if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') return;
+    if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
+        // Cursor/Claude: nút 🤖 không thuộc layout — nếu keyboard cũ còn, mở workspace.
+        return handleWorkspace(ctx);
+    }
     const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
     const isIDE = preferredApp === 'ide';
     
@@ -3380,13 +4119,21 @@ bot.action(/^ans_(.+)$/, async (ctx) => {
     }
 });
 
-async function handleAgentQuery(ctx, query, explicitTargetId = null, explicitThreadName = null) {
+async function handleAgentQuery(ctx, query, explicitTargetId = null, explicitThreadName = null, opts = {}) {
+    // P0: default no vault write unless explicit Human Gate / command (see vault-write-policy.js)
+    const gatedQuery = opts.skipVaultGate ? query : withVaultWriteGate(query);
+
     // ---- CLAUDE CODE ENGINE ----
-    if (currentEngine === 'claude') {
-        return handleClaudeQuery(ctx, query);
+    if (!opts.forceAntigravity && currentEngine === 'claude') {
+        return handleClaudeQuery(ctx, gatedQuery);
+    }
+    // ---- CURSOR AGENT ENGINE ----
+    if (!opts.forceAntigravity && currentEngine === 'cursor') {
+        return handleCursorQuery(ctx, gatedQuery);
     }
     // ---- ANTIGRAVITY ENGINE (existing) ----
     try {
+        query = gatedQuery;
         if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
         let targetId = explicitTargetId;
         let text = "";
@@ -3453,6 +4200,7 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
     let explicitTargetId = null;
     let explicitThreadName = null;
     let explicitClaudeSessionId = null;
+    let explicitCursorSessionId = null;
     if (ctx.message.reply_to_message) {
         const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
         if (typeof val === 'string') explicitTargetId = val;
@@ -3460,6 +4208,7 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
             explicitTargetId = val.targetId; 
             explicitThreadName = val.threadName;
             explicitClaudeSessionId = val.claudeSessionId;
+            explicitCursorSessionId = val.cursorSessionId;
         }
     }
     if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
@@ -3470,25 +4219,30 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
         if (explicitClaudeSessionId) setActiveSession(String(ctx.chat.id), explicitClaudeSessionId);
         return handleClaudeQuery(ctx, query, explicitClaudeSessionId).catch(() => {});
     }
+    if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
+        if (explicitCursorSessionId) setCursorActiveSession(String(ctx.chat.id), explicitCursorSessionId);
+        return handleCursorQuery(ctx, query, explicitCursorSessionId).catch(() => {});
+    }
     
     await handleAgentQuery(ctx, query, explicitTargetId, explicitThreadName);
 });
 
-bot.on('text', (ctx) => {
+bot.on('text', async (ctx) => {
     if (ctx.message.text.startsWith('/') || ctx.message.text.startsWith('!')) return;
 
     // ---- BRAIN2 CRON REPLY detection ----
     if (ctx.message.reply_to_message) {
         const cronInfo = isCronReply(ctx.message.reply_to_message.message_id);
         if (cronInfo) {
-            // Route to An with fresh context (new chat + injected prompt)
+            // Always route cron replies to An (Antigravity CDP), never Claude/Cursor engine
             const contextQuery = buildCronContext(cronInfo, ctx.message.text);
-            console.log(`[Brain2Cron] Reply detected for ${cronInfo.jobId} — opening new chat`);
+            console.log(`[Brain2Cron] Reply detected for ${cronInfo.jobId} — opening new chat (force An)`);
             (async () => {
                 try {
                     await triggerNewChat(CDP_PORT);
                     await new Promise(r => setTimeout(r, 1500));
-                    await handleAgentQuery(ctx, contextQuery, null, null);
+                    // forceAntigravity: do NOT mutate global currentEngine (avoids routing races)
+                    await handleAgentQuery(ctx, contextQuery, null, null, { forceAntigravity: true });
                 } catch (e) {
                     console.error('[Brain2Cron] Reply handling failed:', e.message);
                     ctx.reply('⚠️ Xử lý reply thất bại: ' + e.message);
@@ -3498,10 +4252,14 @@ bot.on('text', (ctx) => {
         }
     }
 
+    if (await dailyLoop.handleText(ctx, ctx.message.text)) return;
+    if (dailyLoop.blocksEngineRouting(ctx.chat.id)) return;
+
     let query = ctx.message.text;
     let explicitTargetId = null;
     let explicitThreadName = null;
     let explicitClaudeSessionId = null;
+    let explicitCursorSessionId = null;
 
     if (ctx.message.reply_to_message) {
         const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
@@ -3510,6 +4268,7 @@ bot.on('text', (ctx) => {
             explicitTargetId = val.targetId; 
             explicitThreadName = val.threadName;
             explicitClaudeSessionId = val.claudeSessionId;
+            explicitCursorSessionId = val.cursorSessionId;
         }
         
         query = extractQuotedContext(ctx) + query;
@@ -3522,6 +4281,12 @@ bot.on('text', (ctx) => {
     if (currentEngine === 'claude') {
         if (explicitClaudeSessionId) setActiveSession(String(ctx.chat.id), explicitClaudeSessionId);
         return handleClaudeQuery(ctx, query, explicitClaudeSessionId).catch(() => {});
+    }
+
+    // ---- CURSOR AGENT routing ----
+    if (currentEngine === 'cursor') {
+        if (explicitCursorSessionId) setCursorActiveSession(String(ctx.chat.id), explicitCursorSessionId);
+        return handleCursorQuery(ctx, query, explicitCursorSessionId).catch(() => {});
     }
 
     // ---- ANTIGRAVITY routing (existing) ----
@@ -3756,15 +4521,16 @@ bot.on(['photo', 'document'], (ctx) => {
 
 // ===== AUDIO/VOICE TRANSCRIPTION (WHISPER.CPP) =====
 async function handleAudioTranscription(ctx, fileId) {
-
+        let tmpAudio = null;
+        let tmpWav = null;
         try {
             const msg = await ctx.reply('🎧 Đang tải và giải mã âm thanh (Local AI)...');
             
             
             const link = await ctx.telegram.getFileLink(fileId);
             
-            const tmpAudio = path.join(os.tmpdir(), `voice_${Date.now()}.ogg`);
-            const tmpWav = path.join(os.tmpdir(), `voice_${Date.now()}.wav`);
+            tmpAudio = path.join(os.tmpdir(), `voice_${Date.now()}.ogg`);
+            tmpWav = path.join(os.tmpdir(), `voice_${Date.now()}.wav`);
             
             // Download file
             const https = require('https');
@@ -3817,6 +4583,34 @@ async function handleAudioTranscription(ctx, fileId) {
             
             await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `🎤 <b>Đã giải mã:</b>\n<i>${text}</i>`, { parse_mode: 'HTML' }).catch(()=>{});
             
+            // ---- BRAIN2 CRON REPLY detection ----
+            if (ctx.message.reply_to_message) {
+                const cronInfo = isCronReply(ctx.message.reply_to_message.message_id);
+                if (cronInfo) {
+                    const contextQuery = buildCronContext(cronInfo, text);
+                    console.log(`[Brain2Cron] Voice Reply detected for ${cronInfo.jobId} — opening new chat (force An)`);
+                    (async () => {
+                        try {
+                            await triggerNewChat(CDP_PORT);
+                            await new Promise(r => setTimeout(r, 1500));
+                            // forceAntigravity: do NOT mutate global currentEngine (avoids routing races)
+                            await handleAgentQuery(ctx, contextQuery, null, null, { forceAntigravity: true });
+                        } catch (e) {
+                            console.error('[Brain2Cron] Voice Reply handling failed:', e.message);
+                            ctx.reply('⚠️ Xử lý reply thất bại: ' + e.message);
+                        }
+                    })();
+                    return;
+                }
+            }
+
+            if (await dailyLoop.handleText(ctx, text)) {
+                return;
+            }
+            if (dailyLoop.blocksEngineRouting(ctx.chat.id)) {
+                return;
+            }
+
             let query = text;
             
             let explicitTargetId = null;
@@ -3843,14 +4637,15 @@ async function handleAudioTranscription(ctx, fileId) {
             
             await handleAgentQuery(ctx, query, explicitTargetId, explicitThreadName);
             
-            // Cleanup
-            fs.unlinkSync(tmpAudio);
-            fs.unlinkSync(tmpWav);
-            
         } catch(err) {
             console.error('Voice Error:', err);
             const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
             ctx.reply('❌ Lỗi xử lý âm thanh: ' + errorMsg).catch(() => {});
+        } finally {
+            // Daily Loop may return before the legacy cleanup path.
+            for (const file of [tmpAudio, tmpWav]) {
+                if (file) try { fs.unlinkSync(file); } catch (_) {}
+            }
         }
     
 }
@@ -3887,6 +4682,11 @@ async function init() {
     } else {
         console.log('[autoaccept] Disabled by default. Use /autoaccept on to enable.');
     }
+
+    refreshCursorAuth(true).then((auth) => {
+        console.log(`[cursor-auth] ${auth.ok ? 'OK' : 'FAIL'} | ${auth.method || 'n/a'} | ${auth.summary || ''}`);
+        if (!auth.ok) console.warn(`[cursor-auth] ${auth.hint || ''}`);
+    }).catch((e) => console.error('[cursor-auth] check error:', e.message));
 
     console.log(t('bot.polling'));
     

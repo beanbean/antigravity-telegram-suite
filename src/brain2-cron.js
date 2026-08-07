@@ -13,6 +13,11 @@
 const { exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const cron = require('node-cron');
+const { resolveVaultRoot } = require('./cursor-controller');
+const { withVaultWriteGate, buildCronVaultPolicy } = require('./vault-write-policy');
+
+const CRON_TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
 
 // Track cron messages so we can detect replies
 // Map<messageId, {jobId, question, sentAt}>
@@ -31,23 +36,34 @@ function isCronReply(replyToMessageId) {
  */
 function buildCronContext(cronInfo, userReply) {
   const CONTEXT_MAP = {
-    '03h-important': 'Brain2 Cron hỏi anh Công: "Hôm nay việc quan trọng nhất là gì?" — anh vừa trả lời.',
-    '06h-focus-today': 'Brain2 Cron gợi ý ai cần tập trung hôm nay — anh vừa phản hồi.',
-    '06h30-morning-radar': 'Brain2 Cron gửi radar followup sáng. Anh reply tên người → soạn tin nhắn chào buổi sáng phù hợp cho người đó, ấm áp, có mention đúng context của họ.',
-    '07h-spaced-usage': 'Brain2 Cron bốc 1 atomic note để ôn luyện. Anh reply → dùng concept đó cùng câu chuyện thực tế của anh Công để viết 1 bài insight/content ngắn cho FB hoặc Zalo.',
-    '09h-ndd-reflect': 'Brain2 Cron nhắc phản tư NDD sáng — anh vừa gửi kết quả phản tư.',
-    '20h-plan-tomorrow': 'Brain2 Cron hỏi kế hoạch ngày mai — anh vừa trả lời.',
+    '03h-important': 'Brain2 Cron hỏi: việc quan trọng nhất hôm nay — anh vừa trả lời. Ghi nhận trong chat; có thể nhắc lại cuối ngày trong hội thoại. CẤM tự lưu vault.',
+    '06h-focus-today': 'Brain2 Cron gợi ý ai cần tập trung — anh vừa phản hồi. Chỉ hội thoại; CẤM tự sửa People/Atomic.',
+    '06h30-morning-radar': 'Brain2 Cron radar followup sáng. Anh reply tên người → soạn tin nhắn chào trong chat (ấm, đúng context). CẤM tự ghi People note hay interaction trừ khi anh lệnh rõ + confirm.',
+    '07h-spaced-usage': 'Brain2 Cron ôn atomic note. Anh reply → soạn draft insight/content NGẮN trong chat (dùng concept + chuyện thật). CẤM publish atom/file content trừ khi anh token ghi / !reflect.',
+    '09h-ndd-reflect': 'Brain2 Cron phản tư NDD — anh vừa trả lời. Ghi nhận số liệu/insight trong chat. CẤM auto /reflect hay Write 01-Atomic/. Muốn lưu insight → bảo anh !reflect rồi chờ ghi.',
+    '20h-plan-tomorrow': 'Brain2 Cron đóng/plan ngày — anh vừa trả lời. Ghi nhận plan trong chat. CẤM tự lưu reflection atomic. Daily Loop đóng ngày có nút ✅ riêng nếu bật.',
   };
 
-  const context = CONTEXT_MAP[cronInfo.jobId] || `Brain2 Cron (${cronInfo.jobId}) — anh vừa trả lời.`;
+  const context = CONTEXT_MAP[cronInfo.jobId] || `Brain2 Cron (${cronInfo.jobId}) — anh vừa trả lời. Chỉ chat; CẤM tự lưu vault.`;
+  const policy = buildCronVaultPolicy(cronInfo.jobId);
 
-  return `[Brain2 Cron Context]\n${context}\n\nCâu hỏi gốc:\n"${cronInfo.question}"\n\nTrả lời của anh Công:\n"${userReply}"\n\nHãy xử lý reply này: ghi nhận, lưu vào Brain2 nếu phù hợp, và phản hồi ngắn gọn.`;
+  const raw = `[Brain2 Cron Context]
+${context}
+
+${policy}
+
+Câu hỏi gốc:
+"${cronInfo.question}"
+
+Trả lời của anh Công:
+"${userReply}"
+
+Xử lý: phản hồi ngắn, ghi nhận ý anh trong chat. KHÔNG lưu Brain2/vault/atomic. Nếu có insight đáng lưu — hỏi anh có muốn !reflect không (chỉ hỏi, chưa ghi).`;
+
+  return withVaultWriteGate(raw);
 }
 
-const VAULT_DIR = path.join(
-  process.env.HOME,
-  'Library/Mobile Documents/iCloud~md~obsidian/Documents/BrainCong/nexmeOS'
-);
+const VAULT_DIR = resolveVaultRoot(process.env.NEXMEOS_VAULT);
 const HOTBRAIN_QUERY = path.join(VAULT_DIR, 'scripts/hotbrain-query.sh');
 const MANIFEST_PATH = path.join(VAULT_DIR, 'scripts/cron/manifest.json');
 const ATOMIC_DIR = path.join(VAULT_DIR, '01-Atomic');
@@ -61,7 +77,7 @@ const MSG_03H = `🌅 Chào anh Công — 1 câu hỏi trước khi ngày bắt 
 
 Hôm nay, NẾU chỉ được làm DUY NHẤT 1 việc mà vẫn cảm thấy ngày hôm nay có ý nghĩa — việc đó là gì?
 
-(Trả lời ngắn gọn, em ghi nhận và nhắc lại cuối ngày)`;
+(Reply ngắn — em ghi nhận trong chat. Muốn lưu vault: !reflect rồi gõ ghi)`;
 
 const MSG_09H = `🧘 Phản tư NDD sáng nay (5 phút):
 
@@ -69,13 +85,15 @@ const MSG_09H = `🧘 Phản tư NDD sáng nay (5 phút):
 2. Ai nổi bật / tiến bộ rõ?
 3. Mình rút ra 1 insight gì từ buổi sáng nay?
 
-(Trả lời ngắn — em lưu vào Brain2 cho anh)`;
+(Reply ngắn — em chỉ ghi nhận trong chat, KHÔNG tự lưu vault. Insight muốn giữ: !reflect → draft → anh gõ ghi)`;
 
 const MSG_20H = `🌙 Anh Công — đóng ngày:
 
 1. Hôm nay việc quan trọng nhất anh đã làm được chưa?
 2. Mai anh định tập trung vào điều gì?
 3. Có gì cần em (Khôi/An) chuẩn bị sẵn không?
+
+(Reply — em ghi nhận trong chat. Lưu reflection vault chỉ khi anh bấm ✅ ở Daily Loop hoặc lệnh !reflect + ghi)
 
 Ngủ ngon anh 🫡`;
 
@@ -339,21 +357,23 @@ async function sendTestCron(bot) {
   return sent;
 }
 
-function scheduleAt(hour, minute, callback) {
-  const check = () => {
-    const now = new Date();
-    if (now.getHours() === hour && now.getMinutes() === minute) {
-      callback();
-    }
-  };
-  // Check every 60s
-  setInterval(check, 60000);
-  console.log(`[Brain2Cron] Scheduled job at ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`);
+function scheduleAt(hour, minute, callback, options = {}) {
+  const dayOfWeek = options.dayOfWeek;
+  const expr = dayOfWeek === undefined
+    ? `${minute} ${hour} * * *`
+    : `${minute} ${hour} * * ${dayOfWeek}`;
+  if (!cron.validate(expr)) {
+    console.error(`[Brain2Cron] Invalid cron expression: ${expr}`);
+    return;
+  }
+  cron.schedule(expr, callback, { timezone: CRON_TZ });
+  const suffix = dayOfWeek === undefined ? '' : ` (dow=${dayOfWeek})`;
+  console.log(`[Brain2Cron] Scheduled job at ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} (${CRON_TZ})${suffix}`);
 }
 
 // ===== EXPORT: startBrain2Cron(bot) =====
 
-function startBrain2Cron(bot) {
+function startBrain2Cron(bot, dailyLoop = null) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!chatId) {
     console.warn('[Brain2Cron] No TELEGRAM_CHAT_ID — disabled');
@@ -365,6 +385,10 @@ function startBrain2Cron(bot) {
   // 03h — Hỏi điều quan trọng nhất
   scheduleAt(3, 0, async () => {
     try {
+      if (dailyLoop && await dailyLoop.sendFocusPrompt({ telegram: bot.telegram, chatId })) {
+        console.log('[Brain2Cron] ✓ 03h Daily Loop focus sent');
+        return;
+      }
       const sent = await bot.telegram.sendMessage(chatId, MSG_03H);
       cronMessageMap.set(sent.message_id, { jobId: '03h-important', question: MSG_03H, sentAt: new Date() });
       updateManifest('03h-important', 'ok');
@@ -452,6 +476,10 @@ function startBrain2Cron(bot) {
   // 20h — Kế hoạch ngày mai
   scheduleAt(20, 0, async () => {
     try {
+      if (dailyLoop && await dailyLoop.sendCloseDayPrompt({ telegram: bot.telegram, chatId })) {
+        console.log('[Brain2Cron] ✓ 20h Daily Loop close-day sent');
+        return;
+      }
       const sent = await bot.telegram.sendMessage(chatId, MSG_20H);
       cronMessageMap.set(sent.message_id, { jobId: '20h-plan-tomorrow', question: MSG_20H, sentAt: new Date() });
       updateManifest('20h-plan-tomorrow', 'ok');
@@ -467,6 +495,16 @@ function startBrain2Cron(bot) {
     renderDashboard();
     updateManifest('06h-render-dashboard', 'ok');
   });
+
+  // Sunday 19:30 — feature-gated Weekly Reset. Legacy jobs remain unchanged.
+  scheduleAt(19, 30, async () => {
+    if (!dailyLoop) return;
+    try {
+      await dailyLoop.sendWeeklyPrompt({ telegram: bot.telegram, chatId });
+    } catch (e) {
+      console.error('[Brain2Cron] ✗ Weekly Reset failed:', e.message);
+    }
+  }, { dayOfWeek: 0 });
 
   console.log('[Brain2Cron] ✓ All 6 jobs scheduled (03h, 06h, 06h30-radar, 07h-spaced, 09h, 20h)');
 }

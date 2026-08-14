@@ -155,7 +155,7 @@ async function checkForUpdates() {
  * Perform a self-update: git pull, npm install (if needed), pm2 restart.
  * Returns a promise that resolves with the update result message.
  */
-function performUpdate() {
+function performUpdate(onRestartFail) {
     return new Promise((resolve, reject) => {
         const pmId = process.env.pm_id;
         const isWatchdog = process.env.WATCHDOG === 'true';
@@ -224,7 +224,10 @@ function performUpdate() {
                             process.exit(0);
                         } else {
                             exec(`pm2 restart ${pmId}`, (err2) => {
-                                if (err2) console.error(`PM2 restart failed: ${err2.message}`);
+                                if (err2) {
+                                    console.error(`PM2 restart failed: ${err2.message}`);
+                                    if (onRestartFail) onRestartFail(err2);
+                                }
                             });
                         }
                     }, 3000);
@@ -257,6 +260,16 @@ function startUpdateChecker(bot, chatIds) {
 
     const doCheck = async () => {
         try {
+            const updateFlagPath = path.join(PROJECT_ROOT, '.update_flag');
+            if (fs.existsSync(updateFlagPath)) {
+                const pmId = process.env.pm_id || 'antigravity-telegram-suite';
+                const stuckMsg = `⚠️ <b>[Auto-Update]</b> Update loop detected!\n\nThe bot downloaded an update but failed to restart automatically (PM2 may be missing from PATH or process not managed by PM2).\n\n<b>To fix this, please run manually on your server:</b>\n<code>git merge --abort</code>\n<code>git reset --hard origin/main</code>\n<code>npm install</code>\n<code>pm2 restart ${pmId}</code>`;
+                for (const chatId of chatIds) {
+                    await bot.telegram.sendMessage(chatId, stuckMsg, { parse_mode: 'HTML' }).catch(() => {});
+                }
+                return; // Stop here, do not attempt to update again until manually fixed
+            }
+
             const result = await checkForUpdates();
             if (result.available) {
                 // Send auto-update starting message
@@ -269,7 +282,13 @@ function startUpdateChecker(bot, chatIds) {
 
                 // Execute the update
                 try {
-                    await performUpdate();
+                    await performUpdate(async (err2) => {
+                        const pmId = process.env.pm_id || 'antigravity-telegram-suite';
+                        const failMsg = `⚠️ <b>[Auto-Update]</b> Failed to restart automatically after update.\nPM2 Error: <code>${err2.message}</code>\n\nPlease run manually:\n<code>pm2 restart ${pmId}</code>`;
+                        for (const chatId of chatIds) {
+                            await bot.telegram.sendMessage(chatId, failMsg, { parse_mode: 'HTML' }).catch(() => {});
+                        }
+                    });
                     // performUpdate will write the .update_flag and restart or exit
                 } catch (updateErr) {
                     const failMsg = t('update.auto_update_failed', { error: updateErr.message }) ||

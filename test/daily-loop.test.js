@@ -216,6 +216,34 @@ const { extractFromReflection } = require('../src/daily-loop/extract');
   assert(preemptReplies[0][0].includes('Em hiểu'), 'explicit task must preempt close-awaiting reflection');
   assert.strictEqual(store.chat(9).active?.type, 'confirm');
 
+  // Life Loop checklist (phone-first dogfood board)
+  assert.strictEqual(loop.parseExplicit('/life').type, 'life-start');
+  assert.strictEqual(loop.parseExplicit('/checklist').type, 'life-start');
+  const lifeReplies = [];
+  const lifeCtx = {
+    chat: { id: 42 },
+    reply: async (...args) => lifeReplies.push(args),
+    answerCbQuery: async () => {},
+    telegram: {
+      editMessageText: async (...args) => lifeReplies.push(['edit', ...args]),
+    },
+    callbackQuery: null,
+  };
+  assert.strictEqual(await loop.handleText(lifeCtx, '/life'), true);
+  assert(String(lifeReplies[0][0]).includes('Life Loop'), 'life checklist must open');
+  assert.strictEqual(lifeReplies[0][1].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'dl:life:capture'), true);
+  lifeCtx.callbackQuery = { id: 'life-1', data: 'dl:life:capture', message: { message_id: 9001 } };
+  assert.strictEqual(await loop.handleCallback(lifeCtx), true);
+  assert.strictEqual(store.chat(42).lifeLoop?.[Object.keys(store.chat(42).lifeLoop || {})[0]]?.capture, true, 'capture must toggle on');
+  lifeCtx.callbackQuery = { id: 'life-2', data: 'dl:life:capture', message: { message_id: 9001 } };
+  await loop.handleCallback(lifeCtx);
+  assert.strictEqual(store.chat(42).lifeLoop?.[Object.keys(store.chat(42).lifeLoop || {})[0]]?.capture, false, 'capture must toggle off');
+  const weekReplies = [];
+  lifeCtx.reply = async (...args) => weekReplies.push(args);
+  lifeCtx.callbackQuery = { id: 'life-week', data: 'dl:life:week', message: { message_id: 9002 } };
+  await loop.handleCallback(lifeCtx);
+  assert(String(weekReplies[0][0]).includes('7 ngày'), 'week view must render');
+
   process.env.DAILY_LOOP_CAPTURE_ENABLED = 'false';
   assert.strictEqual(loop.parseExplicit('nhắc anh gọi Phát ngày mai'), null);
   assert.strictEqual(loop.parseExplicit('đã thiền').type, 'habit');

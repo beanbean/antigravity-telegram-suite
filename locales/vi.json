@@ -418,5 +418,10 @@
     "syntax": "💡 <b>Cú pháp gọi nhanh:</b>\n<code>!{name} [tham số]</code>\n\nNhấn lệnh trên để sao chép, sửa trên thanh chat rồi gửi!",
     "back_btn": "◀️ Về danh sách Skills",
     "run_btn": "▶️ Chạy Skill"
+  },
+  "localImageFallback": "Ảnh",
+  "localImageSent": "đã gửi về điện thoại",
+  "feature": {
+    "claude_unsupported": "❌ Tính năng này chỉ có trên Antigravity.\nDùng 🔀 Engine để chuyển, hoặc /panel để làm mới menu."
   }
 }

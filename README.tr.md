@@ -2,7 +2,7 @@
 
 # 🤖 Antigravity Telegram Suite
 
-**Hem [Antigravity Standalone App](https://antigravity.google/)\* hem de [Antigravity IDE](https://antigravity.google/) ile çalışır.**
+**Hem [Antigravity Standalone App](https://antigravity.google/) hem de [Antigravity IDE](https://antigravity.google/) ile çalışır.**
 
 🌍 Diller: [English](README.md) | [中文](README.zh.md) | [한국어](README.ko.md) | [Türkçe](README.tr.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Français](README.fr.md)
 
@@ -14,11 +14,13 @@ Telefonunuzdan mesaj gönderin, yapay zeka modellerini değiştirin, çalışma 
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![Version](https://img.shields.io/badge/Version-3.4.0-orange.svg)]()
 
-\* *Bazı özelliklerin Standalone (Bağımsız) Uygulamada kısıtlamaları olabilir. [Bilinen Sorunlar](#-bilinen-sorunlar) kısmına göz atın.*
-
 </div>
 
 ---
+
+## 📢 Topluluk
+- **Duyuru Kanalı:** [@agts_updates](https://t.me/agts_updates)
+- **Sohbet Grubu:** [@agts_community](https://t.me/agts_community)
 
 ## ✨ Özellikler
 
@@ -51,6 +53,7 @@ Telefonunuzdan mesaj gönderin, yapay zeka modellerini değiştirin, çalışma 
 
 ### Gereksinimler
 
+- **Çift Motor Desteği (IDE & Standalone):** `/app` komutu ile Classic Monaco IDE ve Standalone Agent arasında sorunsuzca geçiş yapın. İzole sürücü mimarileri, sıfır çakışma ve geçiş yaparken kusursuz arka plan süreç yönetimi sağlar.
 - [Node.js](https://nodejs.org/) >= 18
 - [Antigravity IDE](https://antigravity.google/) ve/veya [Antigravity Standalone App](https://antigravity.google/) yüklü olmalıdır
 - Bir Telegram bot token'ı ([@BotFather](https://t.me/BotFather)'dan alınabilir)
@@ -308,11 +311,19 @@ Bot eşzamanlı çalışan **iki Antigravity uygulamasını** destekler:
 
 | Sorun | Detay |
 |-------|---------|
-| **Standalone Uygulama Kısıtlamaları** | Bazı özellikler (workspace geçişi, thread yönetimi) Standalone sürümde her zaman kararlı çalışmayabilir. **Antigravity IDE tamamen desteklenmektedir ve kullanılması şiddetle tavsiye edilir.** |
+| **Standalone Uygulama Desteği** | Tüm komutlar Antigravity 2.0 Standalone App ile tam uyumlu çalışmaktadır. `/agents`, model seçimi, otomatik onay ve sohbet takibi dahil tüm özellikler desteklenmektedir. |
 | **IDE 2.0 Oto-Güncellemeleri** | Antigravity IDE kendini güncellerse, DOM seçicileri bot da güncellenene kadar geçici olarak bozulabilir. |
 | **Turbo Mod Model Erişimi** | Turbo Mod, hem Claude hem de Gemini modellerine erişim gerektirir. Biri eksikse işlem başarısız olur. |
 
-> 💡 Bir geliştirici olarak odak noktam IDE desteğini kusursuz tutmaktır. Standalone uygulamaya entegrasyon "elimizden geldiğince" desteklenmektedir.
+---
+
+## 🤝 Katkıda Bulunma
+
+1. Depoyu fork edin
+2. Özellik dalınızı oluşturun (`git checkout -b feature/amazing-feature`)
+3. Değişikliklerinizi commit edin (`git commit -m 'feat: add amazing feature'`)
+4. Dalınıza push edin (`git push origin feature/amazing-feature`)
+5. [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite) deposuna bir Pull Request açın
 
 ---
 

@@ -20,6 +20,10 @@ Envía mensajes, cambia modelos de IA, administra espacios de trabajo, toma capt
 
 ---
 
+## 📢 Comunidad
+- **Canal de Noticias:** [@agts_updates](https://t.me/agts_updates)
+- **Grupo de Discusión:** [@agts_community](https://t.me/agts_community)
+
 ## ✨ Características
 
 | Característica | Descripción |
@@ -51,6 +55,7 @@ Envía mensajes, cambia modelos de IA, administra espacios de trabajo, toma capt
 
 ### Requisitos Previos
 
+- **Soporte de Doble Motor (IDE y Standalone):** Cambia sin problemas entre el Classic Monaco IDE y el Standalone Agent mediante el comando `/app`. Las arquitecturas de controladores aisladas garantizan cero conflictos y una gestión perfecta de los procesos en segundo plano al cambiar.
 - [Node.js](https://nodejs.org/) >= 18
 - [Antigravity IDE](https://antigravity.google/) y/o [Antigravity Standalone App](https://antigravity.google/) instalados
 - Un token de bot de Telegram (consíguelo desde [@BotFather](https://t.me/BotFather))
@@ -338,7 +343,7 @@ Utiliza `/app` para cambiar el enfoque del bot entre las aplicaciones. La config
 2. Crea tu rama de características (`git checkout -b feature/amazing-feature`)
 3. Haz commit a tus cambios (`git commit -m 'Añade una característica increíble'`)
 4. Haz push a la rama (`git push origin feature/amazing-feature`)
-5. Abre un Pull Request
+5. Abre un Pull Request contra [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite)
 
 ---
 

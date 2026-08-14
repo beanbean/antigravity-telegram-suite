@@ -1,18 +1,22 @@
 {
   "name": "telebot",
   "version": "4.0.0",
-  "description": "Control your Antigravity IDE remotely via Telegram. Send messages, switch models, manage workspaces, take screenshots — all from your phone.",
+  "description": "Control Antigravity, Claude Code, and Cursor remotely via Telegram.",
   "main": "src/telegram-bot.js",
   "scripts": {
     "start": "node src/telegram-bot.js",
     "dev": "node src/telegram-bot.js",
+    "watchdog": "node src/watchdog.js",
     "setup": "bash scripts/install.sh",
     "setup:win": "powershell -ExecutionPolicy Bypass -File scripts/install.ps1",
-    "test": "node test/i18n.test.js && node test/updater.test.js",
+    "test": "node test/i18n.test.js && node test/updater.test.js && node test/local_media.test.js && node test/cdp_health.test.js && node test/cdp_slash_command.test.js && node test/model_utils.test.js && node test/memory_convention.test.js && node test/daily-loop.test.js && npm run test:claude",
+    "test:daily-loop": "node test/daily-loop.test.js",
+    "syntax": "node --check src/telegram-bot.js && node --check src/brain2-cron.js && node --check src/daily-loop/index.js && node --check src/daily-loop/store.js && node --check src/daily-loop/hotbrain.js",
     "test:smoke": "node test/smoke.test.js",
     "test:all": "npm test && npm run test:smoke",
     "i18n:validate": "node scripts/validate_i18n.js",
-    "prepare": "husky"
+    "prepare": "husky",
+    "test:claude": "node test/claude-controller.test.js"
   },
   "keywords": [
     "telegram",
@@ -23,7 +27,7 @@
     "cdp",
     "chrome-devtools-protocol"
   ],
-  "author": "Emre Türkmen",
+  "author": "Emre T\u00fcrkmen",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -37,6 +41,8 @@
     "axios": "^1.17.0",
     "chrome-remote-interface": "^0.34.0",
     "dotenv": "^17.4.2",
+    "jsdom": "^29.1.1",
+    "js-yaml": "^5.2.2",
     "node-cron": "^4.2.1",
     "openai": "^6.42.0",
     "pg": "^8.21.0",

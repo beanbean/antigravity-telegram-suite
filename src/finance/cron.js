@@ -35,9 +35,12 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.startCronJobs = startCronJobs;
 const telegraf_1 = require("telegraf");
+const cron = require("node-cron");
 const db_1 = require("./db");
 const dotenv = __importStar(require("dotenv"));
 dotenv.config({ override: true });
+// Giờ chạy cảnh báo thẻ cố định mỗi ngày (mặc định 08:00). Đổi qua env FINANCE_ALERT_CRON nếu cần.
+const ALERT_CRON = process.env.FINANCE_ALERT_CRON || '0 8 * * *';
 // NOTE: Dùng bot instance từ main (giống Brain2Cron), không tự tạo Telegram instance.
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 function startCronJobs(bot) {
@@ -83,9 +86,12 @@ function startCronJobs(bot) {
             console.error('Lỗi khi chạy cron job:', error);
         }
     }
-    // Chạy ngay lúc start
-    checkAlerts();
-    // Đặt loop lặp lại mỗi 24 tiếng (86400000 ms)
-    setInterval(checkAlerts, 86400000);
-    console.log('Đã kích hoạt hệ thống nhắc nhở tự động.');
+    // Neo vào giờ cố định mỗi ngày (không chạy lúc start để tránh spam khi restart,
+    // và không trôi giờ theo setInterval). Timezone Asia/Ho_Chi_Minh.
+    if (!cron.validate(ALERT_CRON)) {
+        console.error(`⚠️ FINANCE_ALERT_CRON không hợp lệ: "${ALERT_CRON}" — dùng mặc định 0 8 * * *`);
+    }
+    const schedule = cron.validate(ALERT_CRON) ? ALERT_CRON : '0 8 * * *';
+    cron.schedule(schedule, checkAlerts, { timezone: 'Asia/Ho_Chi_Minh' });
+    console.log(`Đã kích hoạt nhắc nợ thẻ tự động theo lịch "${schedule}" (Asia/Ho_Chi_Minh).`);
 }

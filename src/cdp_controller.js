@@ -15,6 +15,7 @@ let windowCache = [];
 // so /latest doesn't have to guess which thread to read from.
 let lastResolvedThreadId = null;
 function getLastResolvedThreadId() { return lastResolvedThreadId; }
+function setLastResolvedThreadId(id) { lastResolvedThreadId = id; }
 
 // Hook for external subscribers (e.g., TaskWatcher) to be notified when thread ID changes
 let _onThreadResolved = null;
@@ -30,17 +31,41 @@ function _notifyThreadResolved(threadId) {
  * @param {boolean} includeIframe - whether to include iframe/webview types
  * @returns {Promise<Array>} sorted array of CDP target objects
  */
-const { UI_LOCATORS_SCRIPT } = require('./ui_locators');
-
+const DriverFactory = require('./drivers');
 const SUBMIT_ACTION_TEXTS = [
-    'submit', 'send', 'send message', 'gönder', 'approve', 'allow', 'confirm',
-    '提交', '发送', '发送消息', '确认', '确定'
+    'submit', 'send', 'send message', 'gönder',
+    '提交', '发送', '发送消息'
 ];
 const PENDING_ACTION_TEXTS = [
     'run', 'accept', 'allow', 'continue', 'retry',
     'çalıştır', 'kabul et', 'izin ver', 'devam et', 'yeniden dene',
     '运行', '接受', '允许', '继续', '重试'
 ];
+
+function isLikelyClassicIDETarget(target = {}) {
+    const text = `${target.title || ''} ${target.url || ''}`.toLowerCase();
+    return (
+        text.includes('antigravity ide') ||
+        text.includes('classic ide') ||
+        text.includes('vscode-webview') ||
+        text.includes('vscode-') ||
+        text.includes('monaco')
+    );
+}
+
+function parseSelectableSlashCommand(prompt) {
+    const match = String(prompt || '').trim().match(/^\/([a-zA-Z][\w-]*)(?:\s+([\s\S]*))?$/);
+    if (!match) return null;
+    const command = match[1].toLowerCase();
+    if (command !== 'goal') return null;
+    return { command, args: (match[2] || '').trim() };
+}
+
+function getSelectableSlashCommandForTarget(prompt, target = {}) {
+    const preferredApp = DriverFactory.getDriver().appType;
+    if (preferredApp === 'ide' || isLikelyClassicIDETarget(target)) return null;
+    return parseSelectableSlashCommand(prompt);
+}
 
 // Cache for the active workspace name, refreshed on each resolveTargets call
 let activeWorkspaceName = null;
@@ -52,12 +77,15 @@ const threadNameToIdCache = new Map();
  */
 function findConversationIdByTitle(threadName) {
     if (!threadName) return null;
-    if (threadNameToIdCache.has(threadName)) {
+
+    const isStandalone = DriverFactory.getDriver().appType === 'standalone';
+
+    if (isStandalone && threadNameToIdCache.has(threadName)) {
         return threadNameToIdCache.get(threadName);
     }
 
     try {
-        const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+        const appDataName = DriverFactory.getDriver().appDataName;
         const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
         if (!fs.existsSync(brainPath)) return null;
 
@@ -116,10 +144,39 @@ function findConversationIdByTitle(threadName) {
                             
                             // Check if thread title matches first user message
                             // IDE generates titles from the first message, so they overlap
-                            if (firstMsg.includes(searchName.substring(0, minMatchLen)) || 
-                                searchName.includes(firstMsg.substring(0, minMatchLen))) {
-                                threadNameToIdCache.set(threadName, dir.name);
-                                if (threadNameToIdCache.size > 500) { threadNameToIdCache.delete(threadNameToIdCache.keys().next().value); }
+                            const words1 = searchName.split(/\s+/).filter(w => w.length > 2);
+                            const words2 = firstMsg.split(/\s+/).filter(w => w.length > 2);
+                            const intersect = words1.filter(w => words2.includes(w));
+                            const overlapRatio = (words1.length > 0 && words2.length > 0) ? (intersect.length / Math.min(words1.length, words2.length)) : 0;
+                            
+                            let isMatch = false;
+                            
+                            if (isStandalone) {
+                                const hasLongCommonSub = () => {
+                                    for (let len = 12; len >= 8; len--) {
+                                        for (let i = 0; i <= searchName.length - len; i++) {
+                                            const sub = searchName.substring(i, i + len);
+                                            if (firstMsg.includes(sub)) return true;
+                                        }
+                                    }
+                                    return false;
+                                };
+                                
+                                isMatch = firstMsg.includes(searchName.substring(0, minMatchLen)) || 
+                                          searchName.includes(firstMsg.substring(0, minMatchLen)) ||
+                                          (words1.length >= 2 && words2.length >= 2 && overlapRatio >= 0.5) ||
+                                          hasLongCommonSub();
+                            } else {
+                                isMatch = firstMsg.includes(searchName.substring(0, minMatchLen)) || 
+                                          searchName.includes(firstMsg.substring(0, minMatchLen)) ||
+                                          (words1.length >= 2 && words2.length >= 2 && overlapRatio >= 0.5);
+                            }
+
+                            if (isMatch) {
+                                if (isStandalone) {
+                                    threadNameToIdCache.set(threadName, dir.name);
+                                    if (threadNameToIdCache.size > 500) { threadNameToIdCache.delete(threadNameToIdCache.keys().next().value); }
+                                }
                                 return dir.name;
                             }
                         }
@@ -147,7 +204,7 @@ async function resolveTargets(port, includeIframe = true) {
         !(t.title && t.title.includes('Launchpad')) &&
         t.title !== 'Manager');
 
-    const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+    const preferredApp = DriverFactory.getDriver().appType;
 
     candidates.sort((a, b) => {
         // Preferred target by ID always wins (set via /window command)
@@ -217,9 +274,9 @@ function getCachedWindows() {
 }
 
 
-const CHAT_EXTRACT_EXPR = `
-    ${UI_LOCATORS_SCRIPT}
-    (function() {
+const CHAT_EXTRACT_EXPR = `(() => {
+    ${DriverFactory.getDriver().getLocatorsScript()}
+    return (function() {
         let extractedText = "";
         try {
             // Use the centralized locator to find the active conversation
@@ -228,8 +285,11 @@ const CHAT_EXTRACT_EXPR = `
             function cleanText(text) {
                 if (!text) return "";
                 text = text.replace(/Ask anything.*?for workflows/gi, '');
+                text = text.replace(/Ask anything, @ to mention, \\/ for actions/gi, '');
                 text = text.replace(/0 Files With Changes/g, '');
                 text = text.replace(/Review Changes/g, '');
+                text = text.replace(/\\bReview\\b/g, '');
+                text = text.replace(/\\d+\\s+file[s]?\\s+changed[\\s\\+\\-\\d]*>?/gi, '');
                 text = text.replace(/Gemini[\\s\\d\\.]+Pro[\\s]*\\([^)]*\\)/gi, '');
                 text = text.replace(/Claude[\\s\\w\\.]+\\([^)]*\\)/gi, '');
                 text = text.replace(/GPT[\\s\\w\\.]+\\([^)]*\\)/gi, '');
@@ -239,6 +299,10 @@ const CHAT_EXTRACT_EXPR = `
                 // Removed aggressive time stripping that was destroying valid agent times like 20:00
                 // text = text.replace(/(?<!\\d)\\d{1,2}:\\d{2}(?:\\s*(?:AM|PM))?(?!\\d)/ig, '');
                 text = text.replace(/Thinking.../g, "").replace(/Gelişim App Dev/g, "");
+
+                // Strip out file upload system prompts injected by telegram-suite
+                text = text.replace(/\\[System: The user has uploaded[\\s\\S]*?Use the tool!\\]/g, '');
+                text = text.replace(/User's message:\\s*/gi, '');
 
                 text = text.replace(/^\\s*(Plan|Execute|Review|Task|Walkthrough|Implementation Plan)\\s*$/gm, '');
                 text = text.replace(/undo/g, '');
@@ -257,6 +321,7 @@ const CHAT_EXTRACT_EXPR = `
                 if (node.nodeType !== 1) return '';
                 
                 let tag = node.tagName.toLowerCase();
+                if (tag === 'style' || tag === 'script') return '';
                 if (tag === 'img') {
                     const src = node.currentSrc || node.src || node.getAttribute('src') || '';
                     if (!src) return '';
@@ -303,12 +368,19 @@ const CHAT_EXTRACT_EXPR = `
                 if (tag === 'p' || tag === 'div') return md + '\\n';
                 if (tag === 'li') return '- ' + md + '\\n';
                 if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') return '\\n### ' + md.trim() + '\\n';
+                if (tag === 'span') return md.trim() + ' ';
+                
+                const inlineTags = ['a', 'strong', 'b', 'em', 'i', 'code', 'span', '#text'];
+                if (!inlineTags.includes(tag) && tag !== 'p' && tag !== 'div' && tag !== 'li' && !tag.match(/^h[1-6]$/)) {
+                    return md.trim() + '\\n';
+                }
                 
                 return md;
             }
 
             if (container) {
-                const list = container.querySelector('.relative.flex.flex-col.gap-y-3.px-4, .monaco-list-rows, [class*="message-list"], .chat-messages, [data-testid*="message-list"]');
+                const listSelector = '.relative.flex.flex-col.gap-y-3.px-4, .monaco-list-rows, [class*="message-list"], .chat-messages, [data-testid*="message-list"]';
+                const list = container.matches && container.matches(listSelector) ? container : (container.querySelector ? container.querySelector(listSelector) : null);
                 if (list) {
                     const msgs = [];
                     for (let child of list.children) {
@@ -337,20 +409,27 @@ const CHAT_EXTRACT_EXPR = `
                             }
                         });
                         
-                        let userNodes = Array.from(clone.querySelectorAll('.bg-input, [data-message-author="user"], [class*="group/user-input-step"]'));
-                        if (userNodes.length === 0 && clone.className && clone.className.includes('user-message')) {
+                        let userNodes = Array.from(clone.querySelectorAll('.bg-input, [data-message-author="user"], [class*="group/user-input-step"], .interactive-request, .chat-request'));
+                        if (userNodes.length === 0 && clone.className && (clone.className.includes('user-message') || clone.className.includes('interactive-request') || clone.className.includes('chat-request') || clone.className.includes('user-input'))) {
                             userNodes = [clone];
                         }
                         
                         if (userNodes.length > 0) {
+                            let isEntireRowUser = false;
                             userNodes.forEach(un => {
                                 let uText = cleanText(un.innerText || un.textContent);
                                 if (uText) msgs.push("👤 User:\\n" + uText);
-                                un.remove(); // Remove user text from clone so agent text is left
+                                if (un === clone) {
+                                    isEntireRowUser = true;
+                                } else {
+                                    un.remove(); // Remove user text from clone so agent text is left
+                                }
                             });
                             
-                            let aText = cleanText(nodeToMd(clone));
-                            if (aText) msgs.push("🤖 Agent:\\n" + aText);
+                            if (!isEntireRowUser) {
+                                let aText = cleanText(nodeToMd(clone));
+                                if (aText) msgs.push("🤖 Agent:\\n" + aText);
+                            }
                         } else {
                             let aText = cleanText(nodeToMd(clone));
                             if (aText) msgs.push("🤖 Agent:\\n" + aText);
@@ -383,14 +462,28 @@ const CHAT_EXTRACT_EXPR = `
                                 }
                             });
 
+                            let isUser = false;
+                            let curr = child;
+                            while (curr && curr !== container) {
+                                if (curr.getAttribute('data-message-author') === 'user' || (curr.className && (curr.className.includes('user-message') || curr.className.includes('bg-input') || curr.className.includes('user-input')))) {
+                                    isUser = true;
+                                    break;
+                                }
+                                curr = curr.parentElement;
+                            }
+
                             AG_UI.removeThoughtBlocks(clone);
                             let text = cleanText(nodeToMd(clone));
-                            if (text && !msgs.includes(text)) msgs.push(text);
+                            if (text) {
+                                let prefixed = (isUser ? "👤 User:\\n" : "🤖 Agent:\\n") + text;
+                                if (!msgs.includes(prefixed)) msgs.push(prefixed);
+                            }
                         });
                         extractedText = msgs.join('\\n\\n');
                     } else {
                         // Last resort: clone container and strip interactive/layout elements
                         let clone = container.cloneNode(true);
+                        Array.from(clone.querySelectorAll('style, script, .material-icons, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, .codicon, [class*="icon"]')).forEach(el => el.remove());
                         Array.from(clone.querySelectorAll('button, input, textarea, nav, header, [role="navigation"], [data-project-card], .convo-pill')).forEach(el => el.remove());
                         extractedText = cleanText(clone.innerText || clone.textContent || "");
                     }
@@ -398,8 +491,8 @@ const CHAT_EXTRACT_EXPR = `
             }
         } catch(e) {}
         return String(extractedText);
-    })()
-`;
+    })();
+})()`;
 
 function withTimeout(promise, ms, errorMsg) {
     let timeoutId;
@@ -462,12 +555,14 @@ function httpGet(url, timeoutMs = 5000) {
  * DOM fallback uses globalLastChatState.
  */
 async function snapshotChatState(port, specificTargetId = null, threadName = null) {
+    lastResolvedThreadId = null; // ALWAYS clear stale cache before attempting to anchor
+
     // Strategy 1: If we have a thread name, resolve directly via filesystem
     // This is the most reliable path — used after /agents_N thread switching
     if (threadName) {
         const resolvedId = findConversationIdByTitle(threadName);
         if (resolvedId) {
-            const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+            const appDataName = DriverFactory.getDriver().appDataName;
             const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', resolvedId, '.system_generated', 'logs');
             const hasLogs = fs.existsSync(path.join(logsDir, 'overview.txt')) || fs.existsSync(path.join(logsDir, 'transcript.jsonl'));
             if (hasLogs) {
@@ -508,22 +603,29 @@ async function snapshotChatState(port, specificTargetId = null, threadName = nul
                     let snippet = null;
                     if (parts.length > 1) {
                         const lastResponse = parts[parts.length - 1].trim();
-                        // Take a 50-char snippet from near the start (skip first 20 chars to avoid common patterns)
-                        if (lastResponse.length > 70) {
-                            snippet = lastResponse.substring(20, 70).trim();
-                        } else if (lastResponse.length > 20) {
-                            snippet = lastResponse.substring(0, 50).trim();
+                        // Take a 50-char snippet from the end
+                        if (lastResponse.length > 50) {
+                            snippet = lastResponse.substring(lastResponse.length - 50).trim();
+                        } else {
+                            snippet = lastResponse.trim();
                         }
                     }
                     
                     if (snippet && snippet.length > 15) {
                         // Search transcripts for this snippet
-                        const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+                        const appDataName = DriverFactory.getDriver().appDataName;
                         const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
                         if (fs.existsSync(brainPath)) {
-                            const dirs = fs.readdirSync(brainPath, { withFileTypes: true });
+                            // Sort directories by mtime descending to check most recently active chats first
+                            const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
+                                .filter(d => d.isDirectory())
+                                .map(d => ({
+                                    name: d.name,
+                                    time: fs.statSync(path.join(brainPath, d.name)).mtime.getTime()
+                                }))
+                                .sort((a, b) => b.time - a.time);
+
                             for (const dir of dirs) {
-                                if (!dir.isDirectory()) continue;
                                 const tp = path.join(brainPath, dir.name, '.system_generated', 'logs', 'transcript.jsonl');
                                 if (!fs.existsSync(tp)) continue;
                                 try {
@@ -560,7 +662,7 @@ async function snapshotChatState(port, specificTargetId = null, threadName = nul
     try {
         const activeId = await getActiveThreadId(port, specificTargetId || preferredTargetId);
         if (!activeId) return;
-        const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+        const appDataName = DriverFactory.getDriver().appDataName;
         const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', activeId, '.system_generated', 'logs');
         const hasLogs = fs.existsSync(path.join(logsDir, 'overview.txt')) || fs.existsSync(path.join(logsDir, 'transcript.jsonl'));
         if (!hasLogs) return;
@@ -683,16 +785,32 @@ async function getInteractiveModalState(port, specificTargetId = null) {
             await Runtime.enable();
             const res = await Runtime.evaluate({
                 expression: `(() => {
-                    const container = document.querySelector('.antigravity-agent-side-panel, .modal, [role="dialog"], .interactive-session') || document;
-                    const isModal = !!container.querySelector('textarea[placeholder*="Other" i], textarea[placeholder*="answer" i], input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select, [data-testid="interactive-modal"]');
+
+                    // Helper: check if element is truly visible on screen
+                    // getBoundingClientRect is more reliable than offsetParent/computedStyle
+                    // because IDE sometimes keeps dialogs in DOM with transform/clip tricks
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        if (r.bottom < 0 || r.top > window.innerHeight) return false;
+                        if (r.right < 0 || r.left > window.innerWidth) return false;
+                        const s = window.getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+                    };
                     
-                    const approvalBtns = Array.from(container.querySelectorAll('button')).filter(b => {
-                        const t = (b.textContent || '').trim().toLowerCase();
-                        return t === 'approve' || t === 'reject' || t === 'confirm' || t === 'allow' || t === 'proceed';
-                    });
-                    const hasApproval = approvalBtns.length > 0;
+                    // Find the first visible modal/dialog container, ignoring VSCode/Monaco editor widgets
+                    const allContainers = Array.from(document.querySelectorAll('.modal, [role="dialog"], .interactive-session, [data-testid="interactive-modal"]')).filter(c => !c.classList.contains('editor-widget') && !c.closest('.monaco-editor'));
+                    const visibleContainer = allContainers.find(c => isVisible(c));
+                    const container = visibleContainer || document;
                     
-                    if (!isModal && !hasApproval) return null;
+                    // Only look for interactive elements if the container itself is visible
+                    const isModal = container !== document
+                        ? !!container.querySelector('textarea[placeholder*="Other" i], textarea[placeholder*="answer" i], input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select')
+                        : false;  // if no visible container found, assume no modal
+                    
+                    if (!isModal) return null;
+
                     
                     let headerEl = container.querySelector('.modal-header, [data-testid="interactive-modal"] h2, h3.font-medium, fieldset legend');
                     if (container !== document) {
@@ -766,7 +884,7 @@ async function getInteractiveModalState(port, specificTargetId = null) {
     return null;
 }
 
-async function getFullLatestResponse(port, specificTargetId = null, threadName = null) {
+async function getFullLatestResponse(port, specificTargetId = null, threadName = null, includeThoughts = false) {
     const targetIdToUse = specificTargetId || preferredTargetId;
     
     let modalText = "";
@@ -793,9 +911,12 @@ async function getFullLatestResponse(port, specificTargetId = null, threadName =
         }
     } catch(e) {}
     
-    // === PRIMARY: DOM extraction — always reads from the active/visible thread ===
-    // This is the most reliable approach because the IDE DOM always shows the
-    // currently selected thread, regardless of filesystem state or thread IDs.
+    
+    // === PRIMARY: CDP DOM extraction (reads what's actually on screen) ===
+    // This is the most reliable method for IDE because it reads the REAL active
+    // conversation from the DOM, not a cached/stale threadId from the filesystem.
+    // The filesystem approach was prone to returning responses from wrong conversations
+    // when lastResolvedThreadId pointed to a stale thread.
     try {
         const domResult = await _domLatestExtraction(port, targetIdToUse);
         if (domResult && domResult.trim().length > 0) {
@@ -806,7 +927,7 @@ async function getFullLatestResponse(port, specificTargetId = null, threadName =
             try {
                 const snippet = domResult.length > 80 ? domResult.substring(20, 70).trim() : domResult.substring(0, 40).trim();
                 if (snippet.length > 15) {
-                    const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+                    const appDataName = DriverFactory.getDriver().appDataName;
                     const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
                     if (fs.existsSync(brainPath)) {
                         const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
@@ -838,10 +959,10 @@ async function getFullLatestResponse(port, specificTargetId = null, threadName =
     } catch (e) {
         console.log(`[getFullLatestResponse] DOM extraction failed: ${e.message}`);
     }
-    
-    // === FALLBACK: file-system extraction (when DOM is empty or unavailable) ===
-    // Used when: IDE window is minimized, chat panel is hidden, or DOM extraction
-    // returns empty content. Uses lastResolvedThreadId from snapshotChatState.
+
+    // === FALLBACK: file-system extraction (reads pure markdown) ===
+    // Used when DOM extraction fails or returns empty (e.g. page not loaded yet).
+    // Relies on lastResolvedThreadId or getActiveThreadId to find the conversation.
     try {
         let activeId = lastResolvedThreadId;
         
@@ -851,35 +972,46 @@ async function getFullLatestResponse(port, specificTargetId = null, threadName =
         }
 
         if (activeId) {
-            const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+            const appDataName = DriverFactory.getDriver().appDataName;
             const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', activeId, '.system_generated', 'logs');
             const transcriptPath = path.join(logsDir, 'transcript.jsonl');
             const overviewPath = path.join(logsDir, 'overview.txt');
             
-            const logPath = fs.existsSync(transcriptPath) ? transcriptPath : (fs.existsSync(overviewPath) ? overviewPath : null);
-            const isTranscript = logPath === transcriptPath;
-            
-            if (logPath) {
-                const content = fs.readFileSync(logPath, 'utf8');
-                const lines = content.split('\n').filter(l => l.trim());
-                let modelMsgs = [];
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                const logPath = fs.existsSync(transcriptPath) ? transcriptPath : (fs.existsSync(overviewPath) ? overviewPath : null);
+                const isTranscript = logPath === transcriptPath;
                 
-                for (let i = lines.length - 1; i >= 0; i--) {
-                    try {
-                        const entry = JSON.parse(lines[i]);
-                        if (entry.source === 'USER_EXPLICIT' && entry.content) break;
-                        if (entry.source === 'MODEL') {
-                            if (isTranscript && entry.type !== 'PLANNER_RESPONSE') continue;
-                            if (entry.content && entry.content.trim()) {
-                                modelMsgs.unshift(entry.content.trim());
+                if (logPath) {
+                    const content = fs.readFileSync(logPath, 'utf8');
+                    const lines = content.split('\n').filter(l => l.trim());
+                    let modelMsgs = [];
+                    
+                    for (let i = lines.length - 1; i >= 0; i--) {
+                        try {
+                            const entry = JSON.parse(lines[i]);
+                            if (entry.source === 'USER_EXPLICIT' && entry.content) break;
+                            if (entry.source === 'MODEL') {
+                                if (isTranscript && entry.type !== 'PLANNER_RESPONSE') continue;
+                                if (entry.content && entry.content.trim()) {
+                                    let c = entry.content.trim();
+                                    if (!includeThoughts) {
+                                        c = c.replace(/<thought>[\s\S]*?<\/thought>\n?/g, '').trim();
+                                    }
+                                    if (c) modelMsgs.unshift(c);
+                                }
                             }
-                        }
-                    } catch (_) {}
+                        } catch (_) {}
+                    }
+                    
+                    if (modelMsgs.length > 0) {
+                        console.log(`[getFullLatestResponse] ✓ Filesystem fallback successful: thread ${activeId.substring(0, 8)} (Attempt ${attempt})`);
+                        return { text: modelMsgs.join('\n\n') + modalText, buttons: modalButtons };
+                    }
                 }
                 
-                if (modelMsgs.length > 0) {
-                    console.log(`[getFullLatestResponse] Filesystem fallback: thread ${activeId.substring(0, 8)}`);
-                    return { text: modelMsgs.join('\n\n') + modalText, buttons: modalButtons };
+                if (attempt < 5) {
+                    console.log(`[getFullLatestResponse] Filesystem returned empty messages, waiting 1s for flush... (Attempt ${attempt}/5)`);
+                    await new Promise(r => setTimeout(r, 1000));
                 }
             }
         }
@@ -998,7 +1130,7 @@ async function waitForAgentResponse(port, timeoutMs = 450000, onProgress = null,
                 await Runtime.enable();
                 const check = await Runtime.evaluate({
                     expression: `
-                        ${UI_LOCATORS_SCRIPT}
+                        ${DriverFactory.getDriver().getLocatorsScript()}
                         (function() {
                             const container = document.querySelector('.antigravity-agent-side-panel, .modal, [role="dialog"], .interactive-session') || document;
                             const isModal = !!container.querySelector('textarea[placeholder*="Other" i], textarea[placeholder*="answer" i], input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select, [data-testid="interactive-modal"]');
@@ -1127,28 +1259,90 @@ async function sendViaCDP(text, port, specificTargetId = null) {
             const { Runtime, Input } = client;
             await Runtime.enable();
 
+            const slashCommand = getSelectableSlashCommandForTarget(text, target);
+            const focusComposer = async () => {
+                const res = await Runtime.evaluate({
+                    expression: `
+                        ${DriverFactory.getDriver().getLocatorsScript()}
+                        (() => {
+                            const editor = AG_UI.getChatInput();
+                            if (!editor) return false;
+                            editor.focus();
+                            return true;
+                        })()
+                    `,
+                    returnByValue: true
+                });
+                return !!res?.result?.value;
+            };
+            const nativeClearComposer = async () => {
+                const isMac = process.platform === 'darwin';
+                const modifier = isMac ? 4 : 2;
+                const modifierKey = isMac ? 'Meta' : 'Control';
+                const modifierCode = isMac ? 'MetaLeft' : 'ControlLeft';
+                const modifierVk = isMac ? 91 : 17;
+                await Input.dispatchKeyEvent({ type: 'keyDown', key: modifierKey, code: modifierCode, windowsVirtualKeyCode: modifierVk, nativeVirtualKeyCode: modifierVk, modifiers: modifier });
+                await Input.dispatchKeyEvent({ type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: modifier });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: modifier });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: modifierKey, code: modifierCode, windowsVirtualKeyCode: modifierVk, nativeVirtualKeyCode: modifierVk, modifiers: 0 });
+                await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+            };
+            const nativeTypeComposer = async (value) => {
+                await Input.insertText({ text: value || '' });
+            };
+            const preparedSlashCommand = slashCommand && await focusComposer().then(async focused => {
+                if (!focused) return { slashPrefixTyped: false };
+                await nativeClearComposer();
+                await new Promise(r => setTimeout(r, 100));
+                await nativeTypeComposer('/');
+                return { slashPrefixTyped: true };
+            }).catch(() => ({ slashPrefixTyped: false }));
+
             const focusResult = await withTimeout(Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (async function() {
                         try {
                             const escapedText = ${JSON.stringify(text)};
+                            const slashCommand = ${JSON.stringify(slashCommand)};
+                            const preparedSlashCommand = ${JSON.stringify(preparedSlashCommand)};
+                            const rectOf = (el) => {
+                                if (!el) return null;
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    x: r.x,
+                                    y: r.y,
+                                    width: r.width,
+                                    height: r.height,
+                                    centerX: r.x + r.width / 2,
+                                    centerY: r.y + r.height / 2
+                                };
+                            };
                             
                             // Check if an interactive modal is active
-                            const container = document.querySelector('.antigravity-agent-side-panel, .modal, [role="dialog"]') || document;
-                            const radios = Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
-                            
-                            const approvalBtns = Array.from(container.querySelectorAll('button')).filter(b => {
-                                const t = (b.textContent || '').trim().toLowerCase();
-                                return t === 'approve' || t === 'reject' || t === 'confirm' || t === 'allow' || t === 'proceed';
+
+                            // Important: getBoundingClientRect is more reliable — IDE may keep
+                            // closed dialogs in DOM without display:none (uses transform/clip)
+                            const allDialogs = Array.from(document.querySelectorAll('.modal, [role="dialog"], [data-testid="interactive-modal"]')).filter(c => !c.classList.contains('editor-widget') && !c.closest('.monaco-editor'));
+                            const visibleDialog = allDialogs.find(d => {
+                                const r = d.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0) return false;
+                                if (r.bottom < 0 || r.top > window.innerHeight) return false;
+                                const style = window.getComputedStyle(d);
+                                return style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0;
                             });
-
+                            const container = visibleDialog || document;
+                            const isActualModal = container !== document;
+                            const approvalBtns = isActualModal ? Array.from(container.querySelectorAll('button')).filter(b => ['approve','reject','confirm','allow','proceed'].includes((b.textContent || '').trim().toLowerCase())) : [];
                             const optIndex = parseInt(escapedText) - 1;
-                            const isValidIndex = !Number.isNaN(optIndex) && optIndex >= 0 && escapedText.match(/^\d+$/);
-
-                            const isModalActive = container !== document || radios.length > 0 || approvalBtns.length > 0;
+                            const isValidIndex = !Number.isNaN(optIndex) && optIndex >= 0 && /^\d+$/.test(escapedText);
+                            const radios = isActualModal ? Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) : [];
+                            
+                            const isModalActive = isActualModal || radios.length > 0;
                             const isConfirmAction = escapedText.toLowerCase() === 'onayla' || escapedText.toLowerCase() === 'confirm' || escapedText === 'ans_Approve';
                             const isRejectAction = escapedText.toLowerCase() === 'reddet' || escapedText.toLowerCase() === 'reject' || escapedText === 'ans_Reject';
+
                             
                             if (isModalActive && (isConfirmAction || isRejectAction)) {
                                 if (isValidIndex && optIndex < approvalBtns.length) {
@@ -1218,6 +1412,29 @@ async function sendViaCDP(text, port, specificTargetId = null) {
                             const editor = AG_UI.getChatInput();
                             
                             if (!editor) return { found: false, reason: "no_editor", editorCount: 0 };
+
+                            if (slashCommand) {
+                                if (!preparedSlashCommand || !preparedSlashCommand.slashPrefixTyped) {
+                                    return { found: false, reason: "slash_command_prefix_not_typed", command: slashCommand.command };
+                                }
+                                await new Promise(r => setTimeout(r, 400));
+                                const optionCandidates = Array.from(document.querySelectorAll('button, [role="option"], [role="menuitem"], [cmdk-item], div[role="button"]'))
+                                    .filter(el => el.offsetParent !== null);
+                                const slashOption = optionCandidates.find(el => {
+                                    const optionText = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                    return optionText === slashCommand.command || optionText.startsWith(slashCommand.command + ' ');
+                                });
+                                if (!slashOption) {
+                                    return { found: false, reason: "slash_command_option_not_found", command: slashCommand.command };
+                                }
+                                return {
+                                    found: true,
+                                    method: 'slash_' + slashCommand.command,
+                                    slashOptionRect: rectOf(slashOption),
+                                    nativeTextAfterSelect: slashCommand.args,
+                                    target: '${target.title?.substring(0, 30) || 'unknown'}'
+                                };
+                            }
 
                             editor.focus();
                             try {
@@ -1296,6 +1513,23 @@ async function sendViaCDP(text, port, specificTargetId = null) {
             if (val && val.found) {
                 await new Promise(r => setTimeout(r, 50));
                 try {
+                    const dispatchNativeClick = async (rect) => {
+                        if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) return;
+                        await Input.dispatchMouseEvent({ type: 'mouseMoved', x: rect.centerX, y: rect.centerY, button: 'none' });
+                        await Input.dispatchMouseEvent({ type: 'mousePressed', x: rect.centerX, y: rect.centerY, button: 'left', clickCount: 1 });
+                        await Input.dispatchMouseEvent({ type: 'mouseReleased', x: rect.centerX, y: rect.centerY, button: 'left', clickCount: 1 });
+                    };
+
+                    if (val.slashOptionRect) {
+                        await dispatchNativeClick(val.slashOptionRect);
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(val, 'nativeTextAfterSelect')) {
+                        await Input.insertText({ text: val.nativeTextAfterSelect || '' });
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+
                     let isMac = process.platform === 'darwin';
                     try {
                         const versionInfo = await client.send('Browser.getVersion');
@@ -1343,7 +1577,7 @@ async function triggerNewChat(port) {
             await Runtime.enable();
             const res = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
                         const activeWs = ${activeWsStr};
                         if (activeWs) {
@@ -1357,6 +1591,14 @@ async function triggerNewChat(port) {
                             });
                             
                             if (targetCard) {
+                                // Standalone Agent 2.0 new conversation link
+                                const parent = targetCard.parentElement;
+                                const newConvLink = parent ? parent.querySelector('a[aria-label*="New Conversation" i]') : null;
+                                if (newConvLink && typeof newConvLink.click === 'function') {
+                                    newConvLink.click();
+                                    return { clicked: true, tag: newConvLink.tagName, type: 'workspace-specific-link' };
+                                }
+
                                 const plusIcon = targetCard.querySelector('button[aria-label*="New" i], svg.lucide-plus, svg.lucide-message-square-plus, svg[class*="plus"]') || 
                                                  targetCard.querySelector('path[d="M450-450H220v-60H450V-740h60v230H740v60H510v230H450V-450Z"]');
                                 const plusBtn = plusIcon?.closest('button, [role="button"], a') || (plusIcon && plusIcon.parentElement);
@@ -1416,10 +1658,23 @@ async function triggerModelMenu(port) {
             await Runtime.enable();
             const res = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
                         const btn = AG_UI.getModelSelectorButton();
-                        if (btn) { btn.click(); return true; }
+                        if (btn) {
+                            const ariaControls = btn.getAttribute('aria-controls');
+                            const popoverEl = ariaControls ? document.getElementById(ariaControls) : null;
+                            const isExpanded = btn.getAttribute('aria-expanded') === 'true' || (popoverEl && AG_UI.isVisible(popoverEl));
+                            if (!isExpanded) {
+                                const opts = { bubbles: true, cancelable: true, view: window };
+                                btn.dispatchEvent(new MouseEvent('pointerdown', opts));
+                                btn.dispatchEvent(new MouseEvent('mousedown', opts));
+                                btn.dispatchEvent(new MouseEvent('pointerup', opts));
+                                btn.dispatchEvent(new MouseEvent('mouseup', opts));
+                                btn.dispatchEvent(new MouseEvent('click', opts));
+                            }
+                            return true;
+                        }
                         return false;
                     })()
                 `, returnByValue: true
@@ -1433,228 +1688,107 @@ async function triggerModelMenu(port) {
 
 async function listAgentThreads(port) {
     const candidates = await resolveTargets(port, false);
+    const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+    const allWorkspaces = [];
+    const driver = DriverFactory.getDriver();
     
-    // Phase 1: Check for Standalone Agent 2.0 (returns immediately if found)
+    let popupCollected = false;
+
     for (const target of candidates) {
         try {
             const client = await CDP({ target: target.webSocketDebuggerUrl });
             const { Runtime } = client;
             await Runtime.enable();
             
-            const isStandaloneRes = await Runtime.evaluate({
-                expression: `(() => {
-                    return !!document.querySelector('[data-project-card="true"]');
-                })()`,
-                returnByValue: true
-            });
-            
-            if (isStandaloneRes.result?.value) {
-                const threadsRes = await Runtime.evaluate({
-                    expression: `(() => {
-                        const workspaces = [];
-                        const cards = Array.from(document.querySelectorAll('[data-project-card="true"]'));
+            if (driver.appType === 'ide') {
+                if (!popupCollected) {
+                    const openRes = await Runtime.evaluate({
+                        expression: `(() => {
+                            const existing = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
+                            if (existing) return "already-open";
+                            const icon = document.querySelector("svg.lucide-history");
+                            if (!icon) return "no-icon";
+                            (icon.closest("button") || icon.parentElement).click();
+                            return "opened";
+                        })()`
+                    });
+                    
+                    if (openRes.result?.value !== 'no-icon') {
+                        await new Promise(r => setTimeout(r, openRes.result?.value === 'opened' ? 800 : 200));
                         
-                        for (const card of cards) {
-                            const parent = card.parentElement;
-                            if (!parent) continue;
-                            
-                            const cloned = card.cloneNode(true);
-                            cloned.querySelectorAll('svg').forEach(el => el.remove());
-                            const wsNameRaw = cloned.textContent.trim();
-                            const wsName = wsNameRaw.replace(/\\s+\\d+$/, '');
-                            
-                            if (!wsName) continue;
-                            
-                            const convoEls = Array.from(parent.querySelectorAll('div[role="button"]'))
-                                .filter(el => el.className && typeof el.className === 'string' && el.className.includes('ml-[22px]'));
-                                
-                            const threads = [];
-                            for (const el of convoEls) {
-                                const titleEl = el.querySelector('span.truncate, span.text-sm span');
-                                const timeEl = el.querySelector('span.text-xs.opacity-50.ml-4') || el.querySelector('.text-xs');
-                                const name = titleEl ? titleEl.textContent.trim() : el.textContent.trim();
-                                const time = timeEl ? timeEl.textContent.trim() : '';
-                                
-                                if (name && !/^show\\s+\\d+\\s+more/i.test(name)) {
-                                    threads.push({ name, time });
+                        // Expand all "show more" buttons (e.g. fastpick-show-more-Recent, fastpick-show-more-Running)
+                        await Runtime.evaluate({
+                            expression: `(() => {
+                                const showMoreEls = Array.from(document.querySelectorAll('[id^="fastpick-show-more-"], [id*="show-more"]'));
+                                if (showMoreEls.length === 0) {
+                                    const textMatches = Array.from(document.querySelectorAll('div')).filter(d => /^show\\s+\\d+\\s+more/i.test(d.textContent.trim()));
+                                    textMatches.forEach(el => el.click());
+                                } else {
+                                    showMoreEls.forEach(el => el.click());
                                 }
-                            }
-                            
-                            if (threads.length > 0) {
-                                let group = workspaces.find(w => w.workspace === wsName);
-                                if (!group) {
-                                    group = { workspace: wsName, threads: [] };
-                                    workspaces.push(group);
+                            })()`
+                        });
+                        await new Promise(r => setTimeout(r, 600));
+
+                        const popupRes = await Runtime.evaluate({
+                            expression: driver.getListAgentThreadsScript(),
+                            returnByValue: true
+                        });
+                        
+                        // Close popup
+                        await Runtime.evaluate({
+                            expression: `(() => {
+                                document.body.click();
+                                const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
+                                document.activeElement.dispatchEvent(esc);
+                                document.dispatchEvent(esc);
+                            })()`
+                        });
+                        
+                        const popupWorkspaces = JSON.parse(popupRes.result?.value || '[]');
+                        for (const pw of popupWorkspaces) {
+                            const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(pw.workspace));
+                            if (existing) {
+                                for (const t of pw.threads) {
+                                    if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
                                 }
-                                group.threads.push(...threads);
+                            } else {
+                                allWorkspaces.push(pw);
                             }
                         }
-                        return JSON.stringify(workspaces);
-                    })()`,
+                        popupCollected = true;
+                    }
+                }
+            } else {
+                // Standalone 2.0 extraction
+                const homeRes = await Runtime.evaluate({
+                    expression: driver.getListAgentThreadsScript(),
                     returnByValue: true
                 });
                 
-                await client.close();
-                const workspaces = JSON.parse(threadsRes.result?.value || '[]');
-                return workspaces;
-            }
-            
-            await client.close();
-        } catch(e) { console.debug(`[listAgentThreads] standalone check error: ${e.message}`); }
-    }
-    
-    // Phase 2: Classic IDE — collect threads from ALL open windows
-    const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
-    const allWorkspaces = [];
-    let popupCollected = false;
-    
-    for (const target of candidates) {
-        try {
-            const client = await CDP({ target: target.webSocketDebuggerUrl });
-            const { Runtime } = client;
-            await Runtime.enable();
-            
-            // 1. Collect popup threads only once (they show global recent threads, same across all windows)
-            if (!popupCollected) {
-                const clickRes = await Runtime.evaluate({
-                    expression: `(() => {
-                        if (document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]')) return 'open';
-                        const icon = document.querySelector("svg.lucide-history");
-                        if (icon) { (icon.closest("button") || icon.parentElement).click(); return 'clicked'; }
-                        return 'no_popup';
-                    })()`
-                });
+                const homeWorkspaces = JSON.parse(homeRes.result?.value || '[]');
+                for (const hw of homeWorkspaces) {
+                    const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(hw.workspace));
+                    if (existing) {
+                        for (const t of hw.threads) {
+                            if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
+                        }
+                    } else {
+                        allWorkspaces.push(hw);
+                    }
+                }
                 
-                if (clickRes.result?.value !== 'no_popup') {
-                    await new Promise(r => setTimeout(r, 1000));
-                    
-                    // Expand "show more" if present
-                    await Runtime.evaluate({
-                        expression: `(() => {
-                            const input = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
-                            if (!input) return;
-                            let container = input;
-                            for (let i = 0; i < 15; i++) { if (container.parentElement) container = container.parentElement; }
-                            const allDivs = Array.from(container.querySelectorAll('div'));
-                            const rows = allDivs.filter(d => d.className && d.className.includes('px-2.5') && d.className.includes('cursor-pointer') && d.querySelector('span'));
-                            const firstShowMore = rows.find(r => /^show\\s+\\d+\\s+more/i.test(r.textContent.trim()));
-                            if (firstShowMore) firstShowMore.click();
-                        })()`
-                    });
-                    await new Promise(r => setTimeout(r, 500));
-                    
-                    // Extract popup threads
-                    const popupRes = await Runtime.evaluate({
-                        expression: `
-                            (() => {
-                                const input = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
-                                let container = document.body;
-                                if (input) { container = input; for (let i = 0; i < 15; i++) { if (container.parentElement) container = container.parentElement; } }
-                                const allDivs = Array.from(container.querySelectorAll('div'));
-                                const sectionHeaders = allDivs.filter(d =>
-                                    d.className && typeof d.className === 'string' &&
-                                    (d.className.includes('opacity-50') || d.className.includes('text-muted-foreground')) &&
-                                    d.className.includes('px-2.5') && d.className.includes('pt-4') &&
-                                    d.childNodes.length === 1 && d.childNodes[0].nodeType === 3
-                                );
-                                const rows = allDivs.filter(d =>
-                                    d.className && typeof d.className === 'string' &&
-                                    d.className.includes('px-2.5') && d.className.includes('cursor-pointer') && d.querySelector('span')
-                                );
-                                const workspaces = [];
-                                for (const row of rows) {
-                                    const nameEl = row.querySelector('span.truncate, span.text-sm span');
-                                    const timeEl = row.querySelector('span.text-xs.opacity-50.ml-4');
-                                    const wsEl = row.querySelector('span.text-xs.min-w-0.opacity-50.truncate');
-                                    const name = nameEl ? nameEl.textContent.trim() : '';
-                                    const time = timeEl ? timeEl.textContent.trim() : '';
-                                    if (!name || /^show\\s+\\d+\\s+more/i.test(name)) continue;
-                                    let wsName = '';
-                                    if (wsEl) wsName = wsEl.textContent.trim();
-                                    if (!wsName) {
-                                        let section = '';
-                                        for (const h of sectionHeaders) {
-                                            if (row.compareDocumentPosition(h) & Node.DOCUMENT_POSITION_PRECEDING) section = h.textContent.trim();
-                                        }
-                                        if (section.startsWith('Recent in ')) wsName = section.replace('Recent in ', '');
-                                        else if (section === 'Current') {
-                                            const rh = sectionHeaders.find(h => h.textContent.trim().startsWith('Recent in '));
-                                            wsName = rh ? rh.textContent.trim().replace('Recent in ', '') : 'Current';
-                                        } else wsName = 'IDE';
-                                    }
-                                    let group = workspaces.find(w => w.workspace === wsName);
-                                    if (!group) { group = { workspace: wsName, threads: [] }; workspaces.push(group); }
-                                    group.threads.push({ name, time });
-                                }
-                                return JSON.stringify(workspaces);
-                            })()
-                        `,
-                        returnByValue: true
-                    });
-                    
-                    // Close popup
-                    await Runtime.evaluate({
-                        expression: `(() => {
-                            document.body.click();
-                            const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
-                            document.activeElement.dispatchEvent(esc);
-                            document.dispatchEvent(esc);
-                        })()`
-                    });
-                    
-                    const popupWorkspaces = JSON.parse(popupRes.result?.value || '[]');
-                    for (const pw of popupWorkspaces) {
-                        const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(pw.workspace));
-                        if (existing) {
-                            for (const t of pw.threads) {
-                                if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
-                            }
-                        } else {
-                            allWorkspaces.push(pw);
-                        }
-                    }
-                    popupCollected = true;
-                }
-            }
-            
-            // 2. Always try home screen extraction for this window's workspace-specific threads
-            const homeRes = await Runtime.evaluate({
-                expression: `
-                    (() => {
-                        const panel = document.querySelector(".antigravity-agent-side-panel");
-                        if (!panel) return JSON.stringify([]);
-                        const wsEl = panel.querySelector("div.text-lg.font-medium");
-                        const wsName = wsEl ? wsEl.textContent.trim() : "";
-                        if (!wsName) return JSON.stringify([]);
-                        const btns = Array.from(panel.querySelectorAll("button.group.cursor-pointer"));
-                        const threads = [];
-                        for (const btn of btns) {
-                            const nameEl = btn.querySelector("div.truncate");
-                            const timeEl = btn.querySelector("p.text-muted-foreground");
-                            const name = nameEl ? nameEl.textContent.trim() : "";
-                            const time = timeEl ? timeEl.textContent.trim() : "";
-                            if (name) threads.push({ name, time });
-                        }
-                        if (threads.length === 0) return JSON.stringify([]);
-                        return JSON.stringify([{ workspace: wsName, threads }]);
-                    })()
-                `,
-                returnByValue: true
-            });
-            
-            const homeWorkspaces = JSON.parse(homeRes.result?.value || '[]');
-            for (const hw of homeWorkspaces) {
-                const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(hw.workspace));
-                if (existing) {
-                    for (const t of hw.threads) {
-                        if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
-                    }
-                } else {
-                    allWorkspaces.push(hw);
+                if (homeWorkspaces.length > 0) {
+                    // Standalone targets usually have all threads on a single target if it's the home screen
+                    popupCollected = true; 
                 }
             }
             
             await client.close();
+            
+            if (popupCollected && driver.appType !== 'ide') {
+                break;
+            }
         } catch(e) { console.debug(`[listAgentThreads] window error: ${e.message}`); }
     }
     
@@ -1675,72 +1809,62 @@ async function switchAgentThread(port, threadName, targetWorkspaceName = null) {
             const { Runtime } = client;
             await Runtime.enable();
             
-            // First check if Standalone Agent 2.0 UI is active (presence of project cards in DOM)
-            const isStandaloneRes = await Runtime.evaluate({
-                expression: `(() => {
-                    if (window.location.href && window.location.href.includes('vscode-')) return false;
-                    return !!(document.querySelector('[data-project-card="true"]') || 
-                              document.querySelector('[data-workspace-card="true"]') ||
-                              document.querySelector('[data-project-card]') ||
-                              document.querySelector('[data-workspace-card]'));
-                })()`,
-                returnByValue: true
-            });
+            const driver = DriverFactory.getDriver();
+            const threadNameStr = JSON.stringify(threadName);
+            const targetWsNameStr = targetWorkspaceName ? JSON.stringify(targetWorkspaceName.toLowerCase()) : 'null';
             
-            if (isStandaloneRes.result?.value) {
-                const threadNameStr = JSON.stringify(threadName);
+            if (driver.appType === 'agent') {
                 const clickRes = await Runtime.evaluate({
-                    expression: `(() => {
-                        if (document.title.trim() === ${threadNameStr}) {
-                            return 'already-active';
-                        }
-                        
-                        const convoEls = Array.from(document.querySelectorAll('div[role="button"]'))
-                            .filter(el => el.className && typeof el.className === 'string' && el.className.includes('ml-[22px]'));
-                        
-                        const target = convoEls.find(el => {
-                            const titleEl = el.querySelector('span.truncate, span.text-sm span');
-                            const name = titleEl ? titleEl.textContent.trim() : el.textContent.trim();
-                            return name === ${threadNameStr};
-                        });
-                        
-                        if (target) {
-                            target.click();
-                            return 'clicked';
-                        }
-                        return false;
-                    })()`,
+                    expression: driver.getSwitchThreadScript(threadNameStr, targetWsNameStr),
+                    awaitPromise: true,
                     returnByValue: true
                 });
                 
                 await client.close();
                 
                 if (clickRes.result?.value === 'clicked') {
-                    console.log(`[switchAgentThread] Clicked thread "${threadName}", waiting 2500ms...`);
+                    console.log(`[switchAgentThread] Clicked standalone thread "${threadName}", waiting 2500ms...`);
                     await new Promise(r => setTimeout(r, 2500));
+                    
+                    // Read the new URL from the page to extract conversation ID directly
+                    try {
+                        const client2 = await CDP({ target: target.webSocketDebuggerUrl });
+                        const { Runtime: Runtime2 } = client2;
+                        await Runtime2.enable();
+                        const urlRes = await Runtime2.evaluate({
+                            expression: `window.location.href`,
+                            returnByValue: true
+                        });
+                        await client2.close();
+                        
+                        const href = urlRes.result?.value || '';
+                        const uuidMatch = href.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                        if (uuidMatch) {
+                            const conversationId = uuidMatch[1];
+                            console.log(`[switchAgentThread] Extracted conversation ID from URL: ${conversationId}`);
+                            lastResolvedThreadId = conversationId;
+                            _notifyThreadResolved(conversationId);
+                            threadNameToIdCache.set(threadName, conversationId);
+                        }
+                    } catch (urlErr) {
+                        console.log(`[switchAgentThread] Could not read URL after click: ${urlErr.message}`);
+                    }
+                    
                     return target.id;
                 } else if (clickRes.result?.value === 'already-active') {
-                    console.log(`[switchAgentThread] Thread "${threadName}" is already active, skipping click.`);
+                    console.log(`[switchAgentThread] Thread "${threadName}" is already active.`);
                     return target.id;
                 }
-                console.log(`[switchAgentThread] Target thread "${threadName}" not found in sidebar.`);
+                console.log(`[switchAgentThread] Standalone thread "${threadName}" not found. Result: ${clickRes.result?.value}`);
                 continue;
             }
             
             // Fallback for Classic IDE:
             const openRes = await Runtime.evaluate({
-                expression: `(() => {
-                    const existing = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
-                    if (existing) return "already-open";
-                    const icon = document.querySelector("svg.lucide-history");
-                    if (!icon) return "no-icon";
-                    (icon.closest("button") || icon.parentElement).click();
-                    return "opened";
-                })()`
+                expression: driver.getSwitchThreadScript()
             });
             if (openRes.result?.value === 'no-icon') { await client.close(); continue; }
             await new Promise(r => setTimeout(r, openRes.result?.value === 'opened' ? 800 : 200));
-            const threadNameStr = JSON.stringify(threadName);
             
             // Filter the quickpick list by typing the thread name to handle virtualization
             await Runtime.evaluate({
@@ -1763,39 +1887,7 @@ async function switchAgentThread(port, threadName, targetWorkspaceName = null) {
             await new Promise(r => setTimeout(r, 600)); // Wait for filtering animation
             
             const res = await Runtime.evaluate({
-                expression: `(async () => {
-                    const input = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
-                    if (!input) return false;
-                    let container = input;
-                    for (let i = 0; i < 15; i++) { if (container.parentElement) container = container.parentElement; }
-                    
-                    let target = null;
-                    for (let retry = 0; retry < 10; retry++) {
-                        const rows = Array.from(container.querySelectorAll('div.cursor-pointer')).filter(r => r.className.includes('px-2.5'));
-                        target = rows.find(row => {
-                            const nameEl = row.querySelector('span.truncate, span.text-sm span');
-                            const name = nameEl ? nameEl.textContent.trim() : '';
-                            return name === ${threadNameStr} || (name.length > 10 && ${threadNameStr}.startsWith(name.replace('...', '')));
-                        });
-                        if (target) break;
-                        await new Promise(r => setTimeout(r, 300));
-                    }
-                    
-                    if (target) {
-                        target.scrollIntoView();
-                        target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                        target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                        target.click(); 
-                        return true; 
-                    }
-                    
-                    // If not found, close the popup so it doesn't get stuck
-                    document.body.click();
-                    const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
-                    input.dispatchEvent(esc);
-                    document.dispatchEvent(esc);
-                    return false;
-                })()`,
+                expression: driver.getSwitchThreadQuickpickScript(threadNameStr),
                 awaitPromise: true,
                 returnByValue: true
             });
@@ -1910,124 +2002,15 @@ async function getActiveThreadInfo(port, specificTargetId = null) {
     if (specificTargetId) {
         candidates = candidates.filter(t => t.id === specificTargetId);
     }
-
     // 1. Try to get Name, Workspace, and Thread ID from the DOM
     for (const target of candidates) {
         try {
             const client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 2000, "CDP timeout");
             const { Runtime } = client;
             await Runtime.enable();
+            const driver = DriverFactory.getDriver();
             const res = await withTimeout(Runtime.evaluate({
-                expression: `
-                    (() => {
-                        let name = null;
-                        let nameSource = 'none';
-                        
-                        // Try to find the title next to the history icon
-                        const titleEl = document.querySelector("svg.lucide-history")?.closest("div")?.parentElement?.querySelector("div.whitespace-nowrap");
-                        if (titleEl) {
-                            name = titleEl.textContent.trim();
-                            nameSource = 'history-icon';
-                        } else {
-                            // Fallback for older UI
-                            const all = document.querySelectorAll('[data-testid^="convo-pill-"]');
-                            for (let el of all) {
-                                const row = el.closest('[role="button"]');
-                                if (row && row.classList.contains('bg-list-hover')) {
-                                    name = el.textContent.trim();
-                                    nameSource = 'convo-pill';
-                                    break;
-                                }
-                            }
-                            // Standalone 2.0 fallback — only use document.title if it's NOT an IDE window title
-                            // IDE titles look like "project - Antigravity IDE - file.js" which is NOT a thread name
-                            if (!name) {
-                                const title = document.title;
-                                const isIDETitle = title && (title.includes(' - Antigravity IDE') || title.includes(' - Antigravity -'));
-                                if (!isIDETitle && title) {
-                                    name = title;
-                                    nameSource = 'document-title';
-                                }
-                            }
-                        }
-                        let workspace = null;
-                        const panel = document.querySelector(".antigravity-agent-side-panel");
-                        const wsEl2 = panel ? panel.querySelector("div.text-lg.font-medium") : null;
-                        if (wsEl2) {
-                            workspace = wsEl2.textContent.trim();
-                        } else {
-                            let resolvedWs = null;
-                            let activeEl = null;
-                            try {
-                                const url = window.location.href;
-                                const uuidMatch = url.match(/\\/c\\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-
-                                const activeUuid = uuidMatch ? uuidMatch[1] : null;
-
-                                
-                                if (activeUuid) {
-                                    activeEl = document.querySelector('[data-testid*="' + activeUuid + '"]') || 
-                                               Array.from(document.querySelectorAll('div[role="button"]')).find(el => {
-                                                   const tid = el.getAttribute('data-testid') || '';
-                                                   return tid.indexOf(activeUuid) !== -1;
-                                               });
-                                }
-
-                                if (!activeEl) {
-                                    activeEl = document.querySelector('.bg-sidebar-secondary');
-                                }
-                                
-                                if (activeEl) {
-                                    let current = activeEl;
-                                    let steps = 0;
-                                    while (current && steps < 15) {
-                                        if (current.className && typeof current.className === 'string' && current.className.includes('group/section')) {
-                                            const card = current.querySelector('[data-project-card="true"]');
-                                            if (card) {
-                                                resolvedWs = card.textContent.trim().replace(/\s+\d+$/, '');
-                                                break;
-                                            }
-                                        }
-                                        current = current.parentElement;
-                                        steps++;
-                                    }
-                                }
-                            } catch (err) {}
-                            
-                            if (resolvedWs) {
-                                workspace = resolvedWs;
-                            } else if (activeEl) {
-                                workspace = null;
-                            } else {
-                                // Fallback to older / other UI structures
-                                const wsEl = document.querySelector('div.text-sm.font-medium.truncate');
-                                if (wsEl) {
-                                    workspace = wsEl.textContent.trim();
-                                } else {
-                                    workspace = document.title;
-                                }
-                            }
-                        }
-
-
-
-                        // Try to find active conversation ID via DOM
-                        let threadIdVal = null;
-                        const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-                        const labels = Array.from(document.querySelectorAll('[aria-label*="brain/"], .monaco-icon-label'));
-                        for (let el of labels) {
-                            const aria = el.getAttribute('aria-label') || '';
-                            if (aria.includes('brain/')) {
-                                const match = aria.match(uuidRegex);
-                                if (match) {
-                                    threadIdVal = match[0];
-                                    break;
-                                }
-                            }
-                        }
-                        return { name, workspace, threadId: threadIdVal, nameSource };
-                    })()
-                `,
+                expression: driver.getActiveThreadInfoScript(),
                 returnByValue: true
             }), 3000, "Evaluate timeout");
             await client.close();
@@ -2058,7 +2041,7 @@ async function getActiveThreadInfo(port, specificTargetId = null) {
     // If activeWorkspaceName is set or specificTargetId provides a workspace, filter by it.
     if (!threadId) {
         try {
-            const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
+            const appDataName = DriverFactory.getDriver().appDataName;
             const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
             if (fs.existsSync(brainPath)) {
                 const dirs = fs.readdirSync(brainPath, { withFileTypes: true });
@@ -2090,10 +2073,31 @@ async function getActiveThreadInfo(port, specificTargetId = null) {
                             const logPath = fs.existsSync(transcriptPath) ? transcriptPath : (fs.existsSync(overviewPath) ? overviewPath : null);
                             if (logPath) {
                                 try {
+                                    const stats = fs.statSync(logPath);
                                     const head = fs.readFileSync(logPath, 'utf8').substring(0, 8000);
                                     const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
-                                    if (normalize(head).includes(normalize(filterWorkspace))) {
+                                    const workspaceNameNormalized = normalize(filterWorkspace);
+                                    
+                                    let foundInUserInfo = false;
+                                    const userInfoMatch = head.match(/<user_information>([\s\S]*?)<\/user_information>/);
+                                    if (userInfoMatch) {
+                                        const userInfo = userInfoMatch[1];
+                                        // Match format: /path/to/workspace -> workspaceName
+                                        foundInUserInfo = userInfo.includes(`/${filterWorkspace} ->`) || 
+                                                          userInfo.includes(`\\\\${filterWorkspace} ->`) ||
+                                                          userInfo.includes(`/${filterWorkspace}`) ||
+                                                          userInfo.includes(`-> ${filterWorkspace}`);
+                                    }
+
+                                    if (foundInUserInfo) {
                                         match = true;
+                                    } else {
+                                        // Allow extremely recent new threads (modified within last 90 seconds, size under 8KB)
+                                        // since new threads won't contain workspace path references yet in their first user step.
+                                        const ageMs = Date.now() - stats.mtimeMs;
+                                        if (ageMs < 90000 && stats.size < 8000) {
+                                            match = true;
+                                        }
                                     }
                                 } catch (_) {}
                             }
@@ -2135,7 +2139,7 @@ async function isAgentWorking(port, specificTargetId = null) {
             await Runtime.enable();
             const check = await withTimeout(Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (function() {
                         const container = document.querySelector('.antigravity-agent-side-panel, .modal, [role="dialog"], .interactive-session') || document;
                         const isModal = !!container.querySelector('textarea[placeholder*="Other" i], textarea[placeholder*="answer" i], input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select, [data-testid="interactive-modal"]');
@@ -2179,7 +2183,7 @@ async function getCurrentModel(port) {
             await Runtime.enable();
             const check = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (function() {
                         const btn = AG_UI.getModelSelectorButton();
                         if (btn) {
@@ -2212,7 +2216,10 @@ async function switchStandaloneWorkspace(port, wsName) {
             // First check if Standalone Agent 2.0 UI is active (presence of project cards in DOM)
             const isStandaloneRes = await Runtime.evaluate({
                 expression: `(() => {
-                    return !!document.querySelector('[data-project-card="true"]');
+                    return !!(document.querySelector('[data-project-card="true"]') ||
+                              document.querySelector('[data-workspace-card="true"]') ||
+                              document.querySelector('[data-project-card]') ||
+                              document.querySelector('[data-workspace-card]'));
                 })()`,
                 returnByValue: true
             });
@@ -2221,7 +2228,7 @@ async function switchStandaloneWorkspace(port, wsName) {
                 const cleanWsNameStr = JSON.stringify(cleanWsName);
                 const clickRes = await Runtime.evaluate({
                     expression: `(() => {
-                        const cards = Array.from(document.querySelectorAll('[data-project-card="true"]'));
+                        const cards = Array.from(document.querySelectorAll('[data-project-card="true"], [data-workspace-card="true"], [data-project-card], [data-workspace-card]'));
                         const cleanWsName = ${cleanWsNameStr};
                         
                         const targetCard = cards.find(card => {
@@ -2235,7 +2242,10 @@ async function switchStandaloneWorkspace(port, wsName) {
                         });
                         
                         if (targetCard) {
-                            targetCard.click();
+                            // Only click if collapsed to expand it; don't toggle-close an already open card
+                            if (targetCard.getAttribute('aria-expanded') !== 'true') {
+                                targetCard.click();
+                            }
                             return true;
                         }
                         return false;
@@ -2258,9 +2268,102 @@ async function switchStandaloneWorkspace(port, wsName) {
     return false;
 }
 
+/**
+ * Click an artifact feedback button (Proceed/Cancel) in the IDE via CDP.
+ * Searches for buttons in the chat panel that match the given label text.
+ * 
+ * @param {string} buttonLabel - The button text to find (e.g., 'Proceed', 'Cancel')
+ * @param {number} port - CDP debugging port
+ * @param {string|null} specificTargetId - Optional specific target window
+ * @returns {Promise<boolean>} true if the button was found and clicked
+ */
+async function clickArtifactButton(buttonLabel, port, specificTargetId = null) {
+    const candidates = await resolveTargets(port);
+    let targets = candidates;
+
+    if (specificTargetId) {
+        targets = candidates.filter(t => t.id && t.id.startsWith(specificTargetId));
+    } else if (preferredTargetId) {
+        targets = candidates.filter(t => t.id === preferredTargetId);
+        if (targets.length === 0) targets = candidates;
+    }
+
+    const labelLower = buttonLabel.toLowerCase();
+
+    for (const target of targets) {
+        let client;
+        try {
+            client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 3000, "CDP connect timeout");
+            const { Runtime } = client;
+            await Runtime.enable();
+
+            const result = await withTimeout(Runtime.evaluate({
+                expression: `
+                    (function() {
+                        // Search for the artifact feedback button by its text content
+                        var label = ${JSON.stringify(labelLower)};
+                        var allButtons = Array.from(document.querySelectorAll('button'));
+                        
+                        // Also search inside shadow roots
+                        document.querySelectorAll('*').forEach(function(el) {
+                            if (el.shadowRoot) {
+                                allButtons.push.apply(allButtons, Array.from(el.shadowRoot.querySelectorAll('button')));
+                            }
+                        });
+                        
+                        // Find buttons matching the label
+                        var candidates = allButtons.filter(function(btn) {
+                            var text = (btn.textContent || '').trim().toLowerCase();
+                            return text === label || text.startsWith(label);
+                        });
+                        
+                        if (candidates.length === 0) {
+                            return { found: false, error: 'No button found with text: ' + label };
+                        }
+                        
+                        // Prefer the LAST matching button (most recent artifact)
+                        var btn = candidates[candidates.length - 1];
+                        
+                        // Check if button is actually clickable
+                        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+                            return { found: true, clicked: false, error: 'Button is disabled' };
+                        }
+                        
+                        btn.click();
+                        try {
+                            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        } catch(e) {}
+                        
+                        return { found: true, clicked: true, text: btn.textContent.trim() };
+                    })()
+                `,
+                returnByValue: true
+            }), 8000, "clickArtifactButton timeout");
+
+            await client.close();
+
+            const val = result?.result?.value;
+            if (val && val.clicked) {
+                console.log(`[clickArtifactButton] Clicked "${val.text}" in target ${target.id.substring(0, 8)}`);
+                return true;
+            }
+            if (val && val.found && !val.clicked) {
+                console.log(`[clickArtifactButton] Button found but not clickable: ${val.error}`);
+            }
+        } catch (e) {
+            try { if (client) await client.close(); } catch (_) {}
+            console.log(`[clickArtifactButton] Error in target ${target.id?.substring(0, 8)}: ${e.message}`);
+        }
+    }
+
+    throw new Error(`Could not find or click "${buttonLabel}" button in any IDE target`);
+}
+
 module.exports = {
     PENDING_ACTION_TEXTS,
     SUBMIT_ACTION_TEXTS,
+    getSelectableSlashCommandForTarget,
     findConversationIdByTitle,
     isAgentWorking,
     getFullLatestResponse,
@@ -2269,6 +2372,7 @@ module.exports = {
     captureFullIDEScreenshot,
     waitForAgentResponse,
     sendViaCDP,
+    clickArtifactButton,
     triggerNewChat,
     triggerModelMenu,
     getAvailableModels,
@@ -2283,6 +2387,7 @@ module.exports = {
     getPreferredTargetId,
     getCachedWindows,
     closeWindow,
+    closeAllEditors,
     listAgentThreads,
     switchAgentThread,
     CHAT_EXTRACT_EXPR,
@@ -2290,7 +2395,7 @@ module.exports = {
     getActiveThreadInfo,
     setActiveWorkspace,
     switchStandaloneWorkspace,
-    getLastResolvedThreadId,
+    getLastResolvedThreadId, setLastResolvedThreadId,
     setOnThreadResolved
 };
 
@@ -2318,7 +2423,6 @@ async function captureFullIDEScreenshot(port) {
 
 async function getAvailableModels(port) {
     const raw = await resolveTargets(port, false);
-    // Manager has the active conversation's model selector
     const candidates = raw;
 
     for (const target of candidates) {
@@ -2330,12 +2434,25 @@ async function getAvailableModels(port) {
             // Open model menu first, but avoid toggling it closed if already open.
             const openRes = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
-                        const existingOptions = AG_UI.getModelOptions().filter(el => el.offsetParent !== null);
+                        const existingOptions = AG_UI.getModelOptions().filter(AG_UI.isVisible);
                         if (existingOptions.length > 3) return { alreadyOpen: true };
                         const btn = AG_UI.getModelSelectorButton();
-                        if (btn) { btn.click(); return { clicked: true }; }
+                        if (btn) {
+                            const ariaControls = btn.getAttribute('aria-controls');
+                            const popoverEl = ariaControls ? document.getElementById(ariaControls) : null;
+                            const isExpanded = btn.getAttribute('aria-expanded') === 'true' || (popoverEl && AG_UI.isVisible(popoverEl));
+                            if (!isExpanded) {
+                                const opts = { bubbles: true, cancelable: true, view: window };
+                                btn.dispatchEvent(new MouseEvent('pointerdown', opts));
+                                btn.dispatchEvent(new MouseEvent('mousedown', opts));
+                                btn.dispatchEvent(new MouseEvent('pointerup', opts));
+                                btn.dispatchEvent(new MouseEvent('mouseup', opts));
+                                btn.dispatchEvent(new MouseEvent('click', opts));
+                            }
+                            return { clicked: true };
+                        }
                         return { clicked: false };
                     })()
                 `, returnByValue: true
@@ -2349,33 +2466,57 @@ async function getAvailableModels(port) {
             // Wait for dropdown to open
             await new Promise(r => setTimeout(r, 500));
 
-            // Model listesini oku
             const res = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
                         const cleanModelText = (text) => (text || '')
                             .replace(/Fla\\s*h/g, 'Flash')
                             .replace(/Fa\\s*t/g, 'Fast')
-                            .replace(/\\bOpu(?=\\s|[0-9(])/g, 'Opus')
-                            .replace(/\\s*(Fast|New)\\s*$/i, '')
+                            .replace(/\\bopus?\\b/gi, 'Opus')
+                            .replace(/(Fast|New)\\s*$/, '')
                             .replace(/\\s+/g, ' ')
                             .trim();
+                        
+                        const isModelName = (t) => /^(gemini|claude|gpt|opus|sonnet|flash|llama|mistral|deepseek)/i.test(t);
+                        
+                        const seen = new Set();
                         const models = [];
-                        const items = AG_UI.getModelOptions();
-                        items.forEach(el => {
-                            if (el.offsetParent) {
+                        
+                        // First try AG_UI approach (IDE)
+                        const agItems = AG_UI.getModelOptions();
+                        agItems.forEach(el => {
+                            if (AG_UI.isVisible(el)) {
                                 const t = cleanModelText(el.textContent.trim().split('\\n')[0].trim());
-                                if (t.length > 2 && t.length < 80) models.push(t);
+                                if (t.length > 2 && t.length < 80 && !seen.has(t)) { seen.add(t); models.push(t); }
                             }
                         });
-                        return Array.from(new Set(models));
+                        
+                        // If IDE approach found models, use them
+                        if (models.length > 1) return models;
+                        
+                        // Standalone fallback: scan all leaf elements for model-like text
+                        const allEls = Array.from(document.querySelectorAll('button, [role="option"], [role="menuitem"], li, span, div'));
+                        allEls.forEach(el => {
+                            if (el.children.length > 3) return; // Skip containers
+                            const raw = (el.textContent || '').trim().split('\\n')[0].trim();
+                            const t = cleanModelText(raw);
+                            if (t.length > 3 && t.length < 80 && isModelName(t) && !seen.has(t)) {
+                                seen.add(t);
+                                models.push(t);
+                            }
+                        });
+                        
+                        return models;
                     })()
                 `, returnByValue: true
             });
 
             await client.close();
-            return res.result?.value || [];
+            const modelsFound = res.result?.value || [];
+            if (modelsFound.length > 1) {
+                return modelsFound;
+            }
         } catch(e) {}
     }
     return [];
@@ -2394,39 +2535,44 @@ async function selectModel(port, modelName, specificTargetId = null) {
             const { Runtime } = client;
             await Runtime.enable();
 
-            // Step 1: Check if dropdown is already open, if not click the model selector button
+            // Step 1: Open dropdown
             const openRes = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
-                        // Check if model dropdown is already open by looking for model option buttons
-                        const existingOptions = AG_UI.getModelOptions().filter(el => el.offsetParent !== null);
+                        const existingOptions = AG_UI.getModelOptions().filter(AG_UI.isVisible);
                         if (existingOptions.length > 3) return { alreadyOpen: true };
-                        
-                        // Click the model selector button to open dropdown
-                        const selectorBtn = AG_UI.getModelSelectorButton();
-                        if (selectorBtn) {
-                            selectorBtn.click();
+                        const btn = AG_UI.getModelSelectorButton();
+                        if (btn) {
+                            const ariaControls = btn.getAttribute('aria-controls');
+                            const popoverEl = ariaControls ? document.getElementById(ariaControls) : null;
+                            const isExpanded = btn.getAttribute('aria-expanded') === 'true' || (popoverEl && AG_UI.isVisible(popoverEl));
+                            if (!isExpanded) {
+                                const opts = { bubbles: true, cancelable: true, view: window };
+                                btn.dispatchEvent(new MouseEvent('pointerdown', opts));
+                                btn.dispatchEvent(new MouseEvent('mousedown', opts));
+                                btn.dispatchEvent(new MouseEvent('pointerup', opts));
+                                btn.dispatchEvent(new MouseEvent("mouseup", opts));
+                                btn.dispatchEvent(new MouseEvent('click', opts));
+                            }
                             return { clicked: true };
                         }
                         return { clicked: false };
                     })()
                 `, returnByValue: true
             });
-
             const openVal = openRes.result?.value;
             if (!openVal || (!openVal.clicked && !openVal.alreadyOpen)) {
                 await client.close();
                 continue;
             }
 
-            // Step 2: Wait for dropdown to render
             await new Promise(r => setTimeout(r, 600));
 
-            // Step 3: Find and click the matching model in the dropdown
+            // Step 2: Find and click the model
             const selectRes = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
                         const normalizeModelText = (text) => (text || '')
                             .toLowerCase()
@@ -2436,55 +2582,55 @@ async function selectModel(port, modelName, specificTargetId = null) {
                             .replace(/当前/g, ' ')
                             .replace(/fla\\s*h/g, 'flash')
                             .replace(/fa\\s*t/g, 'fast')
-                            .replace(/\\bopu(?=\\s|[0-9(])/g, 'opus')
+                            .replace(/\\bopus?\\b/g, 'opus')
                             .replace(/\\bfast\\b/g, ' ')
                             .replace(/\\bnew\\b/g, ' ')
                             .replace(/[^a-z0-9]+/g, '');
-                        const cleanModelText = (text) => (text || '')
-                            .replace(/Fla\\s*h/g, 'Flash')
-                            .replace(/Fa\\s*t/g, 'Fast')
-                            .replace(/\\bOpu(?=\\s|[0-9(])/g, 'Opus')
-                            .replace(/\\s*(Fast|New)\\s*$/i, '')
-                            .replace(/\\s+/g, ' ')
-                            .trim();
                         const targetModel = normalizeModelText(${JSON.stringify(modelName)});
-                        const modelOptions = AG_UI.getModelOptions().filter(el => el.offsetParent !== null);
-                        
-                        // Try exact match first
-                        let match = modelOptions.find(b => {
-                            const text = normalizeModelText(b.textContent);
-                            return text === targetModel;
-                        });
-                        
-                        // Try partial/includes match
+
+                        // IDE approach: visible model options
+                        let candidateList = AG_UI.getModelOptions().filter(AG_UI.isVisible);
+
+                        // Standalone fallback: scan buttons/list items
+                        if (candidateList.length < 2) {
+                            candidateList = Array.from(document.querySelectorAll('button, [role="option"], [role="menuitem"], li'))
+                                .filter(el => {
+                                    const t = (el.textContent || '').trim();
+                                    return t.length > 2 && t.length < 100 && /gemini|claude|gpt|opus|sonnet|flash|llama|mistral|deepseek/i.test(t);
+                                });
+                        }
+
+                        // Exact match first
+                        let match = candidateList.find(b => normalizeModelText(b.textContent) === targetModel);
+
+                        // Partial match
                         if (!match) {
-                            match = modelOptions.find(b => {
+                            match = candidateList.find(b => {
                                 const text = normalizeModelText(b.textContent);
                                 return text.includes(targetModel) || targetModel.includes(text);
                             });
                         }
-                        
+
                         if (match) {
-                            // Check if already selected (has bg-gray-500/20 without hover)
-                            const isAlreadySelected = match.className.includes('bg-gray-500/20') && !match.className.includes('hover:bg-gray-500/20');
-                            match.click();
-                            return { 
-                                selected: true, 
-                                modelText: match.textContent.trim(),
-                                wasAlreadySelected: isAlreadySelected
-                            };
+                            const opts = { bubbles: true, cancelable: true, view: window };
+                            match.dispatchEvent(new MouseEvent('pointerdown', opts));
+                            match.dispatchEvent(new MouseEvent('mousedown', opts));
+                            match.dispatchEvent(new MouseEvent('pointerup', opts));
+                            match.dispatchEvent(new MouseEvent('mouseup', opts));
+                            match.dispatchEvent(new MouseEvent('click', opts));
+                            return { selected: true, modelText: match.textContent.trim().split('\\n')[0].trim() };
                         }
-                        
-                        // Return available models for debugging
-                        const available = modelOptions.map(b => cleanModelText(b.textContent));
-                        return { selected: false, available };
+
+                        return { selected: false, available: candidateList.map(b => (b.textContent || '').trim().split('\\n')[0].substring(0, 50)) };
                     })()
                 `, returnByValue: true
             });
 
             await client.close();
             const selectVal = selectRes.result?.value;
-            if (selectVal?.selected) return true;
+            if (selectVal && selectVal.selected) {
+                return true;
+            }
         } catch(e) {}
     }
     return false;
@@ -2501,7 +2647,7 @@ async function stopAgent(port) {
 
             const res = await Runtime.evaluate({
                 expression: `
-                    ${UI_LOCATORS_SCRIPT}
+                    ${DriverFactory.getDriver().getLocatorsScript()}
                     (() => {
                         // First try the real stop button (agent generating)
                         const btn = AG_UI.getStopButton();
@@ -2766,4 +2912,26 @@ async function closeWindow(port) {
         preferredTargetId = null;
     }
     return true;
+}
+
+async function closeAllEditors(port) {
+    const activeTarget = await resolveTargets(port, true);
+    if (!activeTarget) throw new Error("No active workspace found.");
+    
+    const client = await CDP({ port, target: activeTarget.webSocketDebuggerUrl });
+    const { Runtime } = client;
+    await Runtime.enable();
+    
+    const count = await Runtime.evaluate({
+        expression: `
+            (function() {
+                const tabs = document.querySelectorAll('.tab [title^="Close"], .tab [aria-label^="Close"]');
+                let c = 0;
+                tabs.forEach(t => { t.click(); c++; });
+                return c;
+            })()
+        `, returnByValue: true
+    });
+    await client.close();
+    return count?.result?.value || 0;
 }

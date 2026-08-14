@@ -20,6 +20,10 @@ Telegram으로 Antigravity AI 에이전트를 원격 제어하세요.
 
 ---
 
+## 📢 커뮤니티
+- **업데이트 채널:** [@agts_updates](https://t.me/agts_updates)
+- **토론 그룹:** [@agts_community](https://t.me/agts_community)
+
 ## ✨ 기능
 
 | 기능 | 설명 |
@@ -51,6 +55,7 @@ Telegram으로 Antigravity AI 에이전트를 원격 제어하세요.
 
 ### 준비물
 
+- **듀얼 엔진 지원 (IDE & Standalone):** `/app` 명령을 통해 Classic Monaco IDE와 Standalone Agent 간을 원활하게 전환합니다. 격리된 드라이버 아키텍처는 충돌 제로를 보장하며 전환 시 완벽한 백그라운드 프로세스 관리를 제공합니다.
 - [Node.js](https://nodejs.org/) >= 18
 - [Antigravity IDE](https://antigravity.google/) 및/또는 [Antigravity Standalone App](https://antigravity.google/) 설치
 - Telegram bot token ([@BotFather](https://t.me/BotFather)에서 발급)
@@ -338,7 +343,7 @@ antigravity-telegram-suite/
 2. 기능 브랜치를 만듭니다 (`git checkout -b feature/amazing-feature`)
 3. 변경 사항을 커밋합니다 (`git commit -m 'Add amazing feature'`)
 4. 브랜치에 푸시합니다 (`git push origin feature/amazing-feature`)
-5. Pull Request를 엽니다
+5. [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite)에 Pull Request를 엽니다
 
 ---
 

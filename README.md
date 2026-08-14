@@ -1,125 +1,166 @@
-# 🤖 Unified Telebot (Antigravity + Claude Code)
+# 🤖 Unified Telebot (Antigravity + Claude Code + Cursor)
 
-Đây là phiên bản bot Telegram tối thượng được merge từ `antigravity-telegram-suite` và `claude-telegram-bridge`. Bot đóng vai trò làm trung tâm điều khiển (Command Center) cho 2 AI Engine mạnh nhất hiện nay chạy song song trên cùng một máy chủ:
+Bot Telegram làm Command Center cho **3 AI Engine** trên cùng máy chủ (Mac Mini):
 
-1. **Antigravity (CDP):** Điều khiển trình duyệt Chrome chạy Gemini Advanced qua giao thức Chrome DevTools Protocol.
-2. **Claude Code (CLI):** Điều khiển trực tiếp tiến trình ngầm của thư viện dòng lệnh Anthropic.
+1. **Antigravity (CDP):** Điều khiển Antigravity IDE qua Chrome DevTools Protocol.
+2. **Claude Code (CLI):** `spawn claude -p --output-format stream-json`.
+3. **Cursor Agent (CLI):** `spawn agent -p --output-format stream-json` → workspace vault nexmeOS.
 
 ---
 
 ## ✨ Tính năng cốt lõi
 
-### 🔀 Dual Engine Switching (Chuyển đổi Engine linh hoạt)
-*   **1 Bot, 2 Bộ não:** Gõ `/engine` hoặc nhấn nút **`🔀 Engine`** để chuyển đổi ngay lập tức luồng tin nhắn văn bản sang Antigravity hoặc Claude Code.
-*   **Tính năng dùng chung:** Các nút lệnh hệ thống như `📸 Screen` (chụp màn hình IDE), `📦 Artifacts`, `🛠️ Skills`, `/status`, `/quota` luôn hoạt động ổn định bất kể đang ở Engine nào.
+### 🔀 Triple Engine Switching
+*   `/engine` hoặc nút **`🔀 Engine`** → Antigravity | Claude Code | **Cursor Agent**.
+*   Đổi engine → **reply keyboard đổi theo engine** (không còn menu Anti khi đang Cursor/Claude).
+*   **Cursor keyboard:** `📁 workspace` · `🧠 model` · `📊 Status` · `📸 Màn hình` · `🆕 New session` · `🔎 Ask mode` · `🚀 Auto` · `🛠️ Skills` · `🔀 Engine` · `⏹ Stop`
+*   **Claude keyboard:** `📁 workspace` · `🧠 model` · `📋 Session` · `📊 Status` · `🆕 New session` · `🔎 Ask mode` · `🔀 Engine` · `⏹ Stop`
+*   **Antigravity keyboard:** thread/model · Screen · Artifacts · Skills · Turbo · Engine · Latest
+*   `/cursor [prompt]` — one-shot tới Cursor (không cần đổi engine).
+*   `/cursor_ask [prompt]` — Cursor read-only (`--mode ask`), không ghi vault / không lấy lock ghi.
+*   `/cursor_new` — reset session Cursor.
+*   `/cursor_auto` — bật/tắt Auto (`--force`) per chat.
+*   `/claude [prompt]` — one-shot tới Claude Code (không cần đổi engine).
+*   `/claude_ask [prompt]` — Claude read-only, không ghi vault / không lấy lock ghi.
+*   `/claude_new` — reset session Claude.
+*   `/help claude` — giải thích menu Claude Code tiếng Việt.
+*   `/help cursor` — giải thích menu Cursor tiếng Việt.
+*   Cron reply (Brain2) **luôn** về An (Antigravity), không bị lệch theo engine đang chọn.
 
-### 🧠 Tích hợp Claude Code (CLI)
-*   **Tiết kiệm RAM tuyệt đối:** Chạy ngầm hoàn toàn bằng `spawn` NodeJS, tốn chỉ ~100-250MB RAM so với >1GB của trình duyệt Chrome.
-*   **Báo cáo thời gian thực (Real-time Streaming):** Bắt sự kiện `--output-format stream-json`, hiển thị trực tiếp lên Telegram công cụ AI đang dùng (VD: `🛠 [1] Bash: npm run build` -> `🛠 [2] ViewFile: index.js`).
-*   **Quản lý Session (`/session`):** Cho phép xem danh sách các phiên làm việc, khôi phục lại ngữ cảnh cũ, hoặc tạo mới (`🆕 New`) hoàn toàn.
-*   **Hủy tức thì (`/stop`):** Bắn tín hiệu `SIGTERM` giết tiến trình ngay lập tức, giải phóng tài nguyên lập tức.
+### 💠 Cursor Agent (CLI)
+*   Binary mặc định: `~/.local/bin/agent` (env `CURSOR_BIN`).
+*   Workspace mặc định: `~/Projects/nexmeOS` (env `CURSOR_WORK_DIR`).
+*   **Model picker (Cursor):** `🧠` / `/model` → 1 trang, model **đang bật** trên Cursor IDE (ID + tiền tố `gcli/...`, `9f/pro/...`); lưu `cursor_model.txt`.
+*   **Model picker (Claude Code):** `🧠` / `/model` → 1 trang từ `~/.claude/settings.json` → `models[]` (ID + tiền tố `kr/...`, `gcli/...`); lưu `claude_model.txt`.
+*   **Auto mode:** `🚀 Auto` hoặc `/cursor_auto` — ON = `--force` (tự chạy tool); OFF = cẩn thận hơn. State per chat trong `cursor_auto_by_chat.json`.
+*   **Screenshot:** `📸 Màn hình` — `screencapture` cửa sổ Cursor hoặc full screen Mac (không phải CDP DOM như Anti).
+*   Ghi vault → telebot acquire/release `.nexmeos-lock` (`ai: cursor`).
+*   Auth: `agent login` trên Mac Mini **hoặc** `CURSOR_API_KEY` trong `.env`. Chưa login → lỗi graceful (không crash bot).
 
-### 🌐 Tích hợp Antigravity (CDP)
-*   **Cào dữ liệu bằng Session hiện tại:** Chạy trực tiếp trên trình duyệt nên giữ nguyên được Cookie, trạng thái đăng nhập. Cực kỳ đắc lực cho skill `/craw` để lấy dữ liệu từ các nhóm kín (Skool, khóa học).
-*   **Tối ưu chi phí:** Không tốn phí API Token (chỉ tốn phí thuê bao Gemini Advanced hàng tháng). Thích hợp để đọc code base siêu lớn hoặc tác vụ lặp dài.
-*   **Chế độ Turbo (`/turbo`):** Mở nhiều tab để chạy song song nhiều Agent, tạo hội đồng đánh giá chéo (Council Mode).
+### 🧠 Claude Code (CLI)
+*   Binary mặc định: `claude` (env `CLAUDE_BIN`).
+*   Workspace mặc định: `~/Projects/nexmeOS` (env `CLAUDE_WORK_DIR`) — đổi runtime bằng `📁` / `/workspace`.
+*   Stream tool events lên Telegram; `/session`, `/stop`.
+*   **Ask mode:** `/claude_ask` hoặc nút `🔎 Ask mode` — không ghi vault, không lấy `.nexmeos-lock`.
+*   Ghi vault (agent mode) → telebot acquire/release `.nexmeos-lock` (`ai: claude-code`).
+*   Prompt luôn prepend vault Human Gate + handoff/context Khôi.
+*   Lỗi CLI: giữ stderr tail để debug (không nuốt im).
+
+### 🌐 Antigravity (CDP)
+*   Cookie session, Turbo (council đa model), autoaccept, screenshot IDE qua CDP.
 
 ---
 
-## 🚀 Hướng dẫn Cài đặt & Cấu hình
+## 🚀 Cài đặt & Cấu hình
 
-### Yêu cầu hệ thống
-*   [Node.js](https://nodejs.org/) >= 18
-*   Đã cài đặt [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) (`npm install -g @anthropic-ai/claude-code`)
-*   Đã cài đặt Antigravity IDE (hoặc Standalone App).
+### Yêu cầu
+*   Node.js >= 18
+*   Antigravity IDE (CDP)
+*   (Tuỳ chọn) Claude Code CLI
+*   (Tuỳ chọn) Cursor Agent: `curl https://cursor.com/install -fsS | bash` rồi `agent login`
+*   macOS Screen Recording permission (cho `📸 Màn hình` Cursor)
 
-### 1. Cấu hình biến môi trường (`.env`)
+### `.env` (xem thêm `.env.example`)
 ```env
-# Telegram
-BOT_TOKEN=your_telegram_bot_token
-ALLOWED_CHAT_ID=your_chat_id
+BOT_TOKEN=...
+ALLOWED_CHAT_ID=...
 
-# Engine Mặc định (antigravity hoặc claude)
-DEFAULT_ENGINE=claude
-
-# Cấu hình Claude Code
 CLAUDE_BIN=claude
-CLAUDE_WORK_DIR=/path/to/projects
-CLAUDE_SKIP_PERMS=true
+# Optional override; omit to use ~/Projects/nexmeOS
+# CLAUDE_WORK_DIR=/absolute/path/to/workspace
 CLAUDE_TIMEOUT=900000
 
-# Cấu hình Antigravity CDP
+CURSOR_BIN=/Users/congdau/.local/bin/agent
+CURSOR_WORK_DIR=/Users/congdau/Projects/nexmeOS
+CURSOR_TIMEOUT=900000
+CURSOR_FORCE=true   # default Auto ON cho chat mới
+# CURSOR_API_KEY=   # hoặc: agent login
+
 AGENT_CDP_PORT=9333
 IDE_CDP_PORT=9334
 ANTIGRAVITY_PREFERRED_APP=ide
 ```
 
-### 2. Khởi chạy hệ thống
-
-**Bước 2.1: Bật tiến trình Antigravity (có mở cổng debug)**
+### Chạy / restart
 ```bash
-# Trên macOS
 open -a "Antigravity IDE" --args --remote-debugging-port=9334
-```
-
-**Bước 2.2: Bật Telebot qua PM2**
-```bash
-pm2 start src/index.js --name telebot
-pm2 save
+agent login   # một lần
+pm2 start src/telegram-bot.js --name telebot
+pm2 restart telebot   # sau khi sửa code
 ```
 
 ---
 
-## 📱 Bảng lệnh (Command Reference)
+## 📱 Lệnh Cursor
 
-### Quản lý Hệ thống & Engine
-| Lệnh | Phím Bấm | Mô tả |
-|---|---|---|
-| *(nhập text)* | | Gửi tin nhắn trực tiếp tới Engine đang được chọn |
-| `/engine` | `🔀 Engine` | Chuyển đổi qua lại giữa Antigravity và Claude Code |
-| `/status` | | Xem trạng thái kết nối, Engine hiện tại, RAM/CPU và PID |
-| `/stop` | | Hủy/kill tiến trình đang chạy (của cả CDP hoặc CLI) |
-| `/screenshot` | `📸 Screen` | Chụp ảnh màn hình Antigravity IDE đang chạy |
-| `/restart` | | Khởi động lại bot (chạy lệnh pm2 restart) |
+| Lệnh / Nút | Mô tả |
+|---|---|
+| `/cursor [prompt]` | Gửi tới Cursor Agent (ghi vault + lock) |
+| `/cursor_ask [prompt]` | Read-only ask mode |
+| `/cursor_new` | Reset session Cursor |
+| `/cursor_auto` | Bật/tắt Auto (`--force`) |
+| `/model` hoặc `🧠` | Chọn model Cursor |
+| `/screenshot` hoặc `📸 Màn hình` | Chụp cửa sổ Cursor / màn hình Mac |
+| `/help cursor` | Hướng dẫn menu Cursor |
+| `/engine` → Cursor | Mọi plain text → Cursor |
+| `/stop` | Huỷ process Cursor đang chạy |
+| `/status` | Model, Auto, session, vault lock |
 
-### Tính năng riêng của Claude Code
-| Lệnh | Phím Bấm | Mô tả |
+### Cursor Auto vs Anti Turbo
+| | Cursor Auto | Anti Turbo |
 |---|---|---|
-| `/session` | `📋 Session` | Quản lý các phiên Claude Code (Resume hoặc tạo New) |
-| `/model` | `🧠 Model` | Chọn model cho Claude CLI (Claude 3.5 Sonnet, v.v...) |
+| Mục đích | Bật `--force` cho 1 agent CLI | Council: Claude plan → Gemini làm → review |
+| Nút | `🚀 Auto` | `🚀 Turbo` |
+| Engine | Chỉ Cursor | Chỉ Antigravity |
 
-### Tính năng riêng của Antigravity (CDP)
-| Lệnh | Phím Bấm | Mô tả |
-|---|---|---|
-| `/turbo` | `🚀 Turbo` | Bật chế độ đa luồng, hội ý nhiều Agent cùng lúc |
-| `/goal` | | Giao phó toàn quyền cho Agent làm đến khi xong thì thôi |
-| `/autoaccept` | | Tự động click các nút "Run", "Accept" xuất hiện trên UI |
-| `/window` | | Đổi cửa sổ điều khiển khi mở nhiều IDE cùng lúc |
-
-### Quản lý File & Artifacts
-| Lệnh | Phím Bấm | Mô tả |
-|---|---|---|
-| `/artifacts` | `📦 Artifacts` | Hiển thị và tải xuống các file kết quả (Artifacts) |
-| `/skills` | `🛠️ Skills` | Liệt kê toàn bộ kỹ năng có sẵn trong thư mục `_Skills/` |
-| `/file` | | Duyệt thư mục dự án và tải file qua Telegram |
+### Hệ thống chung
+| Lệnh | Mô tả |
+|---|---|
+| *(text)* | Gửi tới engine đang chọn |
+| `/engine` | Antigravity / Claude / Cursor |
+| `/screenshot` | Anti = CDP IDE; Cursor = Mac capture |
 
 ---
 
-## 🏗️ Kiến trúc luồng tin nhắn (Message Router)
+## 🏗️ Message Router
 
-Khi người dùng gửi một đoạn Text:
-1. Bot kiểm tra biến toàn cục `currentEngine`.
-2. Nếu là `claude`:
-   - Định tuyến vào `handleClaudeQuery(ctx, query)`.
-   - `claude-controller.js` dùng hàm `spawn` gọi CLI.
-   - Luồng sự kiện JSON được dịch ngược để nháy chữ "đang gõ..." và cập nhật trạng thái Tools sử dụng.
-3. Nếu là `antigravity`:
-   - Định tuyến vào `handleAgentQuery(ctx, query)`.
-   - Gửi yêu cầu qua WebSocket tới cổng `9334` của Chrome.
-   - Đọc liên tục (polling) cây DOM trình duyệt để bắt nội dung phản hồi.
+1. `/cursor*` → luôn Cursor (bypass engine hiện tại).
+2. `/claude*` → luôn Claude Code (bypass engine hiện tại).
+3. Plain text + `currentEngine === cursor` → `handleCursorQuery` → `cursor-controller.js`.
+4. Plain text + `claude` → `handleClaudeQuery` → `claude-controller.js`.
+5. Còn lại → Antigravity CDP.
+6. Reply cron message → **force Antigravity**.
 
 ---
-<div align="center">
-Tài liệu được cập nhật ngày: <b>2026-06-26</b> bởi <b>An (Antigravity)</b>.
-Dành riêng cho hệ thống Brain2 của anh Công Đậu.
-</div>
+
+## Daily Glass Stage 0
+
+Daily Loop là router deterministic chạy trước engine, chỉ bắt explicit phrase/command hoặc workflow đang active. Voice được transcribe đúng một lần rồi đi qua router này; input không thuộc Daily Loop giữ routing cũ.
+
+Mặc định toàn bộ flag tắt:
+
+```env
+DAILY_LOOP_ENABLED=false
+DAILY_LOOP_FOCUS_ENABLED=false
+DAILY_LOOP_CLOSE_ENABLED=false
+DAILY_LOOP_WEEKLY_ENABLED=false
+DAILY_LOOP_CAPTURE_ENABLED=false
+DAILY_LOOP_HABITS_ENABLED=false
+HOTBRAIN_WORKDIR=/Users/congdau/.nexmeos-supabase
+```
+
+Các lệnh/phrase: `/focus`, `/task ...` hoặc `nhắc anh ...`, `đã/chưa <habit>`, `/cham <tên canonical>`, `/dongngay`, `/tuan`.
+
+Trước khi bật:
+
+1. Review schema thật của `tasks` và `interactions`; nếu tên cột khác, chỉ sửa hai function adapter trong `supabase/migrations/20260718_daily_glass_stage0.sql`.
+2. Từ linked workdir, chạy migration thủ công: `cd "$HOTBRAIN_WORKDIR" && supabase db query --linked --file /Users/congdau/telebot/supabase/migrations/20260718_daily_glass_stage0.sql`.
+3. Chạy `npm run syntax && npm test`.
+4. Bật flag từng phần trong `.env`, rồi `pm2 restart telebot --update-env`.
+5. Rollback schema (nếu cần): dùng `20260718_daily_glass_stage0_down.sql`. Tắt flag trước khi rollback.
+
+Nếu migration chưa apply hoặc Supabase CLI lỗi, bot giữ candidate/state local và trả cảnh báo; không chuyển input Daily Loop sang AI engine và không crash.
+
+---
+
+*Cập nhật 2026-08-12 — Claude Code ops: vault lock + ask mode + /claude* + prompt context.*

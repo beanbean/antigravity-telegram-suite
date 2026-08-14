@@ -8,6 +8,14 @@ const { buildFocusProposal } = require('./focus-sources');
 const { dateKey, parseRelativeDate, stripTaskDate, startOfWeek } = require('./utils');
 
 const HABITS = ['Thiền', 'Ôm hôn vợ', 'Hỏi The ONE Thing', 'Tập thể dục', 'Đọc sách'];
+const LIFE_ITEMS = [
+  { key: 'capture', label: 'Capture' },
+  { key: 'reflect', label: 'Reflect' },
+  { key: 'ops', label: 'Ops' },
+  { key: 'content', label: 'Content' },
+  { key: 'close', label: 'Close' },
+];
+const emptyLifeDay = () => Object.fromEntries(LIFE_ITEMS.map((item) => [item.key, false]));
 const enabled = (name) => process.env[name] === 'true';
 const id = () => crypto.randomBytes(8).toString('hex');
 const keyboard = (rows) => ({ reply_markup: { inline_keyboard: rows } });
@@ -177,6 +185,7 @@ function createDailyLoop(options = {}) {
     if (moduleOn('DAILY_LOOP_CLOSE_ENABLED') && /^(?:\/dongngay|đóng ngày|\/retryreflection)\b/i.test(raw)) return { type: 'close-start', retry: /^\/retryreflection/i.test(raw) };
     if (moduleOn('DAILY_LOOP_WEEKLY_ENABLED') && /^(?:\/tuan|weekly reset)\b/i.test(raw)) return { type: 'weekly-start' };
     if (moduleOn('DAILY_LOOP_FOCUS_ENABLED') && /^(?:\/focus|the one thing)\b/i.test(raw)) return { type: 'focus-start' };
+    if (featureOn() && /^(?:\/life|\/checklist|life loop|checklist)\b/i.test(raw)) return { type: 'life-start' };
     return null;
   }
 
@@ -332,10 +341,12 @@ function createDailyLoop(options = {}) {
     } else if (parsed.type === 'weekly-start') {
       store.updateChat(ctx.chat.id, (state) => { state.active = { type: 'weekly-awaiting' }; });
       await ctx.reply('📅 Weekly Reset:\n1. Một mục tiêu tuần tới\n2. Việc còn tồn\n3. Project nào đang chờ/bị chặn/hoàn tất\n4. Một bài học hoặc điều chỉnh');
+    } else if (parsed.type === 'life-start') {
+      await sendLifeChecklist(ctx);
     } else await sendFocusPrompt({ telegram: ctx.telegram, chatId: ctx.chat.id });
   }
 
-  const AMBIENT_PREEMPT_TYPES = new Set(['task', 'habit', 'interaction', 'focus-start', 'weekly-start']);
+  const AMBIENT_PREEMPT_TYPES = new Set(['task', 'habit', 'interaction', 'focus-start', 'weekly-start', 'life-start']);
 
   async function handleText(ctx, text) {
     if (!featureOn()) return false;
@@ -417,6 +428,9 @@ function createDailyLoop(options = {}) {
     if (!data.startsWith('dl:')) return false;
     const [, action, candidateId] = data.split(':');
     await ctx.answerCbQuery().catch(() => {});
+    if (action === 'life') {
+      return handleLifeCallback(ctx, candidateId);
+    }
     if (action.startsWith('focus-') && !moduleOn('DAILY_LOOP_FOCUS_ENABLED')) return false;
     if (action === 'focus-custom') {
       store.updateChat(ctx.chat.id, (chat) => { chat.active = { type: 'focus-custom' }; });
@@ -562,6 +576,101 @@ function createDailyLoop(options = {}) {
     return true;
   }
 
+
+  function lifeState(chatId, day = dateKey()) {
+    const saved = store.chat(chatId).lifeLoop?.[day] || {};
+    return { ...emptyLifeDay(), ...saved };
+  }
+
+  function formatLifeDay(day, state) {
+    const done = LIFE_ITEMS.filter((item) => state[item.key]).length;
+    const lines = LIFE_ITEMS.map((item) => `${state[item.key] ? '✅' : '⬜'} ${item.label}`);
+    return `📋 Life Loop — ${day} (${done}/5)\n\n${lines.join('\n')}\n\nBấm nút để tick/bỏ tick. /life mở lại.`;
+  }
+
+  function lifeKeyboard(state) {
+    const mark = (item) => ({
+      text: `${state[item.key] ? '✅' : '⬜'} ${item.label}`,
+      callback_data: `dl:life:${item.key}`,
+    });
+    return keyboard([
+      LIFE_ITEMS.slice(0, 3).map(mark),
+      LIFE_ITEMS.slice(3).map(mark),
+      [{ text: '📅 Tuần (7 ngày)', callback_data: 'dl:life:week' }],
+    ]);
+  }
+
+  function formatLifeWeek(chatId, endDay = dateKey()) {
+    const [y, m, d] = endDay.split('-').map(Number);
+    const lines = [];
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const day = dateKey(new Date(Date.UTC(y, m - 1, d - offset, 12)));
+      const state = lifeState(chatId, day);
+      const marks = LIFE_ITEMS.map((item) => (state[item.key] ? '✅' : '⬜')).join('');
+      const done = LIFE_ITEMS.filter((item) => state[item.key]).length;
+      lines.push(`${day}  ${marks}  ${done}/5`);
+    }
+    return `📅 Life Loop — 7 ngày gần nhất\n\n${lines.join('\n')}\n\n/life để tick hôm nay.`;
+  }
+
+  async function renderLifeMessage(ctx, day, state) {
+    const body = formatLifeDay(day, state);
+    const extra = lifeKeyboard(state);
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    if (messageId && ctx.telegram?.editMessageText) {
+      try {
+        await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, body, extra);
+        return;
+      } catch (error) {
+        if (/message is not modified/i.test(error.message || '')) return;
+      }
+    }
+    if (typeof ctx.editMessageText === 'function' && messageId) {
+      try {
+        await ctx.editMessageText(body, extra);
+        return;
+      } catch (error) {
+        if (/message is not modified/i.test(error.message || '')) return;
+      }
+    }
+    await ctx.reply(body, extra);
+  }
+
+  async function sendLifeChecklist(ctx) {
+    if (!featureOn()) return false;
+    const day = dateKey();
+    const state = lifeState(ctx.chat.id, day);
+    await logEvent(ctx.chat.id, 'life_checklist_opened', { day });
+    await renderLifeMessage(ctx, day, state);
+    return true;
+  }
+
+  async function handleLifeCallback(ctx, itemKey) {
+    if (!featureOn()) return false;
+    const day = dateKey();
+    if (itemKey === 'week') {
+      await ctx.reply(formatLifeWeek(ctx.chat.id, day));
+      return true;
+    }
+    if (!LIFE_ITEMS.some((item) => item.key === itemKey)) {
+      await ctx.reply('⚠️ Mục life loop không hợp lệ.');
+      return true;
+    }
+    const next = store.updateChat(ctx.chat.id, (chat) => {
+      chat.lifeLoop ||= {};
+      chat.lifeLoop[day] = { ...emptyLifeDay(), ...(chat.lifeLoop[day] || {}) };
+      chat.lifeLoop[day][itemKey] = !chat.lifeLoop[day][itemKey];
+      const keys = Object.keys(chat.lifeLoop).sort();
+      if (keys.length > 60) {
+        for (const old of keys.slice(0, keys.length - 60)) delete chat.lifeLoop[old];
+      }
+      return chat.lifeLoop[day];
+    });
+    await logEvent(ctx.chat.id, 'life_item_toggled', { day, item: itemKey, checked: next[itemKey] });
+    await renderLifeMessage(ctx, day, next);
+    return true;
+  }
+
   async function sendFocusPrompt({ telegram, chatId }) {
     if (!featureOn() || !enabled('DAILY_LOOP_FOCUS_ENABLED')) return false;
     const day = dateKey();
@@ -607,10 +716,11 @@ function createDailyLoop(options = {}) {
     sendFocusPrompt,
     sendCloseDayPrompt,
     sendWeeklyPrompt,
+    sendLifeChecklist,
     isActive: active,
     blocksEngineRouting,
     parseExplicit,
   };
 }
 
-module.exports = { createDailyLoop, HABITS, parseRelativeDate, stripTaskDate, dateKey, startOfWeek };
+module.exports = { createDailyLoop, HABITS, LIFE_ITEMS, parseRelativeDate, stripTaskDate, dateKey, startOfWeek };

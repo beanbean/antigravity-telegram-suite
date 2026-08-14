@@ -1,4 +1,4 @@
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), override: true });
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
@@ -11,8 +11,8 @@ const axios = require('axios');
 const { extractFinancialInfo } = require('./finance/ai');
 const { addTransaction, updateBillingStatement, getCreditCards, getSpentAmountThisCycle } = require('./finance/db');
 const { startCronJobs } = require('./finance/cron');
-const { config, isIDERunning, killIDE, cleanLockFile, launchIDE, trustWorkspaceViaCDP, PLATFORM } = require('./platform');
-const { isAgentWorking, getFullLatestResponse, snapshotChatState, captureAgentScreenshot, captureFullIDEScreenshot, waitForAgentResponse, sendViaCDP, triggerNewChat, triggerModelMenu, getAvailableModels, selectModel, getCurrentModel, stopAgent, getQuota, listWindows, setPreferredWindow, getPreferredWindow, getPreferredTargetId, getCachedWindows, closeWindow, listAgentThreads, switchAgentThread, getActiveThreadId, getActiveThreadInfo, setActiveWorkspace, switchStandaloneWorkspace, getLastResolvedThreadId, setOnThreadResolved } = require('./cdp_controller');
+const { config, isIDERunning, killIDE, cleanLockFile, launchIDE, getLastWorkspace, trustWorkspaceViaCDP, PLATFORM } = require('./platform');
+const { isAgentWorking, getFullLatestResponse, snapshotChatState, captureAgentScreenshot, captureFullIDEScreenshot, waitForAgentResponse, sendViaCDP, clickArtifactButton, triggerNewChat, triggerModelMenu, getAvailableModels, selectModel, getCurrentModel, stopAgent, getQuota, listWindows, setPreferredWindow, getPreferredWindow, getPreferredTargetId, getCachedWindows, closeWindow, closeAllEditors, listAgentThreads, switchAgentThread, getActiveThreadId, getActiveThreadInfo, setActiveWorkspace, switchStandaloneWorkspace, getLastResolvedThreadId, setLastResolvedThreadId, setOnThreadResolved } = require('./cdp_controller');
 const autoaccept = require('./autoaccept');
 const updater = require('./updater');
 const { runTurboOrchestration } = require('./turbo_orchestrator');
@@ -20,6 +20,11 @@ const TaskWatcher = require('./task_watcher');
 const { extractLocalImageMarkdown } = require('./local_media');
 const { ensureCdpReady, isConnectionRefusedError } = require('./cdp_health');
 const { createDailyLoop } = require('./daily-loop');
+const accountManager = require('./account_manager');
+const { ensureMemoryConvention } = require('./memory_convention');
+const DriverFactory = require('./drivers');
+const telegraphPublisher = require('./telegraph_publisher');
+
 let scheduleClient = null;
 try {
     scheduleClient = require('./schedule_client');
@@ -28,6 +33,7 @@ try {
 }
 
 // ===== CLAUDE CODE ENGINE =====
+const claudeCtrl = require('./claude-controller');
 const {
     sendToClaude,
     cancelSession,
@@ -38,7 +44,9 @@ const {
     getLastSessionId,
     listClaudeModels,
     clearClaudeModelsCache,
-} = require('./claude-controller');
+    DEFAULT_WORKSPACE: CLAUDE_DEFAULT_WORKSPACE,
+    CLAUDE_BIN,
+} = claudeCtrl;
 const { listSessions, getLatestSessionId, formatRelativeTime } = require('./session-store');
 
 // ===== CURSOR AGENT ENGINE =====
@@ -62,8 +70,7 @@ const {
     clearCursorModelsCache,
 } = cursorCtrl;
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
-const CLAUDE_WORK_DIR = process.env.CLAUDE_WORK_DIR || process.env.HOME;
+let CLAUDE_WORK_DIR = CLAUDE_DEFAULT_WORKSPACE;
 const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT) || 900000;
 const CLAUDE_SKIP_PERMS = process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS === 'true';
 
@@ -235,6 +242,33 @@ function getCursorHelpMessage() {
     );
 }
 
+function getClaudeHelpMessage() {
+    return (
+        '🤖 <b>Menu Claude Code (CLI)</b>\n\n'
+        + '<b>Nút bàn phím:</b>\n'
+        + '📁 <b>Workspace</b> — đổi thư mục làm việc (vd. nexmeOS)\n'
+        + '🧠 <b>Model</b> — chọn model từ <code>~/.claude/settings.json</code>\n'
+        + '📋 <b>Session</b> — list / resume session Claude gần đây\n'
+        + '📊 <b>Status</b> — model, session, vault lock, skip-perms\n'
+        + '🆕 <b>New session</b> — reset chat (<code>/claude_new</code>)\n'
+        + '🔎 <b>Ask mode</b> — read-only, không ghi vault (<code>/claude_ask</code>)\n'
+        + '🔀 <b>Engine</b> — đổi Anti / Claude / Cursor\n'
+        + '⏹ <b>Stop</b> — huỷ process Claude đang chạy\n\n'
+        + '<b>Cách gửi lệnh:</b>\n'
+        + '• Engine = Claude → gõ plain text\n'
+        + '• <code>/claude [prompt]</code> — agent (ghi vault + lock <code>ai: claude-code</code>)\n'
+        + '• <code>/claude_ask [câu hỏi]</code> — chỉ đọc/phân tích, không lock\n'
+        + '• <code>/claude_new</code> — session mới\n'
+        + '• <code>/session</code> — chọn session JSONL\n'
+        + '• Reply tin Claude → resume session\n\n'
+        + '<b>Vault / Human Gate:</b>\n'
+        + '• Agent mode acquire/release <code>.nexmeos-lock</code>\n'
+        + '• Prompt luôn có vault gate (DEFAULT = không tự ghi atom)\n'
+        + '• Chỉ ghi knowledge khi anh ra lệnh rõ / token ghi\n\n'
+        + '<i>CWD mặc định:</i> <code>~/Projects/nexmeOS</code> (env <code>CLAUDE_WORK_DIR</code>).'
+    );
+}
+
 const CURSOR_AUTO_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'cursor_auto_by_chat.json');
 function loadCursorAutoState() {
     try {
@@ -266,6 +300,10 @@ function setCursorAuto(chatId, enabled) {
 
 const TURBO_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'turbo_state.json');
 const RESTART_FLAG_FILE = path.join(os.homedir(), '.gemini', 'antigravity', '.restart_pending');
+
+function escHtml(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 function loadTurboState() {
     try {
@@ -309,7 +347,6 @@ function saveMessageTargetMap(map) {
     } catch (err) { console.error('Failed to save messageTargetMap:', err.message); }
 }
 const messageTargetMap = loadMessageTargetMap();
-const textMessageQueues = new Map();
 
 const LANG_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'lang.txt');
 
@@ -421,6 +458,164 @@ bot.command('tuvan', async (ctx) => {
 });
 // ----------------------------
 
+const pendingLogins = new Map();
+const lastSentMessageIdMap = new Map(); // conversationId -> { messageId, chatId, baseKeyboard }
+
+function checkAuth(ctx, next) {
+    const chatId = ctx.chat?.id;
+    const text = ctx.message?.text || '';
+    
+    if (text.startsWith('/')) {
+        accountManager.logInfo(`[auth] Incoming command "${text}" from chatId: ${chatId}`);
+    }
+
+    if (ALLOWED_CHAT_IDS.length === 0) {
+        accountManager.logInfo(`[auth] Rejecting: ALLOWED_CHAT_IDS is empty. Detected chatId: ${chatId}`);
+        console.log(`\n🔔 NEW CHAT ID DETECTED: ${ctx.chat.id}`);
+        console.log(`Please add ALLOWED_CHAT_ID=${ctx.chat.id} to your .env file and restart.\n`);
+        return ctx.reply(t('auth.setup_welcome', { chatId: ctx.chat.id })).catch(e => console.error('[checkAuth]', e.message));
+    }
+    if (!ALLOWED_CHAT_IDS.includes(ctx.chat.id.toString())) {
+        accountManager.logInfo(`[auth] Rejecting unauthorized chatId: ${chatId} (Allowed: ${ALLOWED_CHAT_IDS.join(', ')})`);
+        const from = ctx.from || ctx.chat;
+        if (from && ALLOWED_CHAT_IDS.length > 0) {
+            const username = from.username ? `@${from.username}` : 'N/A';
+            const fullName = `${from.first_name || ''} ${from.last_name || ''}`.trim() || t('auth.anonymous');
+            
+            let actionDetails = t('auth.action', { type: ctx.updateType || t('auth.unknown') });
+            if (ctx.message && ctx.message.text) actionDetails = t('auth.message', { text: ctx.message.text });
+            else if (ctx.callbackQuery) actionDetails = t('auth.button', { data: ctx.callbackQuery.data });
+
+            const alertMsg = t('auth.unauthorized_attempt', { name: fullName, username, id: from.id, details: actionDetails });
+            ctx.telegram.sendMessage(ALLOWED_CHAT_IDS[0], alertMsg, { parse_mode: 'HTML' }).catch(e => console.error('[checkAuth Alert]', e.message));
+        }
+        // Silently ignore unauthorized access to prevent errors if the user blocked the bot
+        return Promise.resolve();
+    }
+    
+    // Suspend other bot updates/callbacks if Google login is in progress
+    if (ctx.chat && pendingLogins.has(ctx.chat.id)) {
+        const isLoginCallback = ctx.callbackQuery?.data?.startsWith('login_');
+        const isTextMessage = ctx.message && ctx.message.text;
+        
+        if (!isLoginCallback && !isTextMessage) {
+            // Block other non-text interactions (like photo uploads, other inline buttons) during login
+            return ctx.reply(t('login.in_progress'), { parse_mode: 'HTML' });
+        }
+    }
+
+    if (text.startsWith('/')) {
+        accountManager.logInfo(`[auth] Authorized chatId: ${chatId} for command "${text}"`);
+    }
+    return next();
+}
+
+bot.use(checkAuth);
+
+// Fix for Issue #31: Prevent menu emojis and bare numbers from fanning out to all bots in a group
+bot.use((ctx, next) => {
+    const text = ctx.message?.text;
+    if (text && ctx.chat?.type !== 'private') {
+        const isMenuEmoji = /^(💬|📸|📦|⚡|🔴|🚀|🤖|🧠)/u.test(text);
+        const isBareNumber = /^\d+$/.test(text.trim());
+        
+        if (isMenuEmoji || isBareNumber) {
+            const hasMention = ctx.botInfo?.username && text.includes('@' + ctx.botInfo.username);
+            const isReplyToMe = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
+            
+            if (!hasMention && !isReplyToMe) {
+                return; // Not addressed to this bot
+            }
+        }
+    }
+    return next();
+});
+
+// ── Passive code detection (mobile fallback) ───────────────────────────────────
+// If a user has a pending login and sends a message containing a Google auth
+// code or a full redirect URL, we intercept it and complete the login.
+bot.use(async (ctx, next) => {
+    if (!ctx.message || !ctx.message.text) {
+        return next();
+    }
+    const chatId = ctx.chat?.id;
+    if (!chatId || !pendingLogins.has(chatId)) {
+        return next();
+    }
+
+    const text = ctx.message.text.trim();
+    
+    // 1. Check if the user wants to cancel the login explicitly
+    if (text.toLowerCase() === '/cancel') {
+        const session = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await session.oauthServer.stop(); } catch { /* ignore */ }
+        if (session && typeof session.reject === 'function') {
+            session.reject(new Error('Login cancelled by user'));
+        }
+        await ctx.reply(t('login.cancelled'), { parse_mode: 'HTML' });
+        return; // Consume message
+    }
+
+    // Skip check if it is explicitly the /logincode command itself without arguments (let command handler run)
+    if (text.startsWith('/logincode') && text.split(' ').length === 1) {
+        return next();
+    }
+
+    // 2. Extract code from text or /logincode command arguments
+    let inputString = text;
+    if (text.startsWith('/logincode ')) {
+        inputString = text.substring(11).trim();
+    }
+
+    let code = null;
+    if (inputString.includes('code=') || inputString.startsWith('4/')) {
+        code = inputString;
+        const match = inputString.match(/[?&]code=([^&\s]+)/);
+        if (match) {
+            code = match[1];
+        }
+    }
+
+    const session = pendingLogins.get(chatId);
+
+    // 3. Process the extracted code or handle invalid try count
+    if (code) {
+        const completed = await completePendingLogin(chatId, code);
+        if (completed) {
+            await ctx.reply(t('login.code_received'), { parse_mode: 'HTML' });
+            return; // Consume message, do not pass to other handlers
+        }
+    } else {
+        // Increment tries for invalid link/code
+        session.tryCount = (session.tryCount || 0) + 1;
+        accountManager.logInfo(`[bot] Invalid login input pasted by chatId ${chatId}. Attempt ${session.tryCount}/3.`);
+
+        if (session.tryCount >= 3) {
+            pendingLogins.delete(chatId);
+            try { await session.oauthServer.stop(); } catch { /* ignore */ }
+            if (session && typeof session.reject === 'function') {
+                session.reject(new Error('Login cancelled: too many invalid attempts'));
+            }
+
+            await ctx.reply([
+                '🚫 <b>' + t('login.cancelled').split('\n')[0].replace(/<[^>]+>/g, '').trim() + '</b>',
+                '━'.repeat(22),
+                t('login.failed_attempts'),
+                '',
+                t('login.cancelled').split('\n').pop(),
+            ].join('\n'), { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply(
+                t('login.invalid_code') + t('login.invalid_code_attempt', { count: session.tryCount }),
+                { parse_mode: 'HTML' }
+            );
+        }
+        return; // Consume message, do not pass to other handlers
+    }
+    return next();
+});
+
 let isTurboRunning = false;
 
 // Safe commands/buttons that can pass through during turbo execution
@@ -428,7 +623,8 @@ const TURBO_SAFE_COMMANDS = [
     '/turbo', '/stop', '/screenshot', '/latest', '/status',
     '/quota', '/help', '/version', '/panel', '/menu',
     '/file', '/cmd', '/autoaccept', '/lang', '/window',
-    '/artifacts', '/restart'
+    '/artifacts', '/restart',
+    '/login', '/accounts', '/switchacc', '/getinfo', '/logincode', '/delacc'
 ];
 const TURBO_SAFE_BUTTONS = [
     '📸', '💬', '📦', '📊', '🚀'
@@ -532,6 +728,75 @@ function updateEnvFile(key, value) {
     }
 }
 
+/**
+ * Auto-migrate missing env keys from .env.example to .env on startup.
+ * Ensures existing users get new required keys (like GOOGLE_CLIENT_ID)
+ * automatically after /update without manual .env editing.
+ */
+function migrateEnvFromExample() {
+    const envPath = path.join(__dirname, '..', '.env');
+    const examplePath = path.join(__dirname, '..', '.env.example');
+    
+    if (!fs.existsSync(envPath) || !fs.existsSync(examplePath)) return;
+    
+    try {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        const exampleContent = fs.readFileSync(examplePath, 'utf8');
+        
+        // Parse keys from both files
+        const envKeys = new Set();
+        envContent.split(/\r?\n/).forEach(line => {
+            const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+            if (match) envKeys.add(match[1]);
+        });
+        
+        // Find keys in .env.example that are missing from .env
+        const missing = [];
+        let currentComment = '';
+        exampleContent.split(/\r?\n/).forEach(line => {
+            if (line.startsWith('#')) {
+                currentComment = line;
+                return;
+            }
+            const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)/);
+            if (match && !envKeys.has(match[1])) {
+                // Skip keys that should be user-specific (BOT_TOKEN, ALLOWED_CHAT_ID)
+                const skipKeys = ['BOT_TOKEN', 'ALLOWED_CHAT_ID', 'SETUP_MODE'];
+                if (skipKeys.includes(match[1])) return;
+                
+                if (currentComment && missing.length === 0) {
+                    missing.push('');  // blank line separator
+                }
+                if (currentComment) {
+                    missing.push(currentComment);
+                    currentComment = '';
+                }
+                missing.push(line);
+            } else {
+                currentComment = '';
+            }
+        });
+        
+        if (missing.length > 0) {
+            const additions = '\n' + missing.join('\n') + '\n';
+            fs.appendFileSync(envPath, additions, 'utf8');
+            
+            // Also load them into process.env for current session
+            missing.forEach(line => {
+                const m = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)/);
+                if (m) process.env[m[1]] = m[2];
+            });
+            
+            console.log(`[env-migrate] Added ${missing.filter(l => l.match(/^[A-Z]/)).length} new key(s) from .env.example to .env`);
+        }
+    } catch (e) {
+        console.error('[env-migrate] Migration failed:', e.message);
+    }
+}
+
+// Run migration on startup
+migrateEnvFromExample();
+
 function markdownToTelegramHtml(text) {
     let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     
@@ -557,6 +822,12 @@ function markdownToTelegramHtml(text) {
     html = html.replace(/\*\*([^\*]+)\*\*/g, '<b>$1</b>');
     html = html.replace(/(?<![A-Za-z0-9])\*([^\*]+)\*(?![A-Za-z0-9])/g, '<i>$1</i>');
     html = html.replace(/(?<![A-Za-z0-9])_([^_]+)_(?![A-Za-z0-9])/g, '<i>$1</i>');
+    html = html.replace(/```([a-z0-9]*)\n([\s\S]*?)```/g, (match, lang, code) => {
+        if (lang) return `<pre><code class="language-${lang}">${code}</code></pre>`;
+        return `<pre>${code}</pre>`;
+    });
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/gi, '<b>$1</b>');
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
     
     // Lists
@@ -676,6 +947,55 @@ async function sendExtractedImage(ctx, image, replyToMsgId = null) {
 // Helper: Send long messages safely within Telegram's 4096 char limit
 async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMsgId = null) {
     const MAX_LEN = 3500;
+    
+    // Extract file links: e.g. [task.md](file:///C:/Users/...)
+    const fileLinkRegex = /\[([^\]]+)\]\((file:\/\/\/[^\)]+)\)/gi;
+    let fileMatch;
+    const fileButtons = [];
+    
+    fileLinkRegex.lastIndex = 0;
+    while ((fileMatch = fileLinkRegex.exec(text)) !== null) {
+        const label = fileMatch[1];
+        const rawUrl = fileMatch[2];
+        try {
+            const rawPath = rawUrl.replace(/^file:\/\/\//i, '');
+            const decodedPath = decodeURIComponent(rawPath);
+            const normalizedPath = path.normalize(decodedPath);
+            const pathId = getPathId(normalizedPath);
+            
+            const mapping = telegraphPublisher.getPageMapping(normalizedPath);
+            if (mapping && mapping.url) {
+                fileButtons.push([{ text: `🌐 Open ${label}`, url: mapping.url }]);
+            }
+        } catch (e) {
+            console.error('[sendLongMessage] Failed to process file link:', e.stack);
+        }
+    }
+
+    const conversationId = getLastResolvedThreadId();
+    const artifactButtons = getArtifactButtons(conversationId);
+    
+    let finalButtons = buttons;
+    let inlineKeyboard = [];
+    
+    if (fileButtons.length > 0) {
+        inlineKeyboard.push(...fileButtons);
+    }
+    if (artifactButtons.length > 0) {
+        inlineKeyboard.push(...artifactButtons);
+    }
+    if (buttons) {
+        if (Array.isArray(buttons)) {
+            inlineKeyboard.push(...buttons);
+        } else if (buttons.reply_markup && Array.isArray(buttons.reply_markup.inline_keyboard)) {
+            inlineKeyboard.push(...buttons.reply_markup.inline_keyboard);
+        }
+    }
+    
+    if (inlineKeyboard.length > 0) {
+        finalButtons = { reply_markup: { inline_keyboard: inlineKeyboard } };
+    }
+
     const localMedia = extractLocalImageMarkdown(text);
     text = localMedia.text;
 
@@ -751,7 +1071,7 @@ async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMs
                 if (inPre) {
                     currentChunk += preLang ? '</code></pre>' : '</pre>';
                 }
-                const sentMsg = await replyWithRetry(currentChunk, false, buttons, 3, currentReplyId);
+                const sentMsg = await replyWithRetry(currentChunk, false, null, 3, currentReplyId);
                 if (sentMsg) {
                     currentReplyId = sentMsg.message_id;
                     sentMsgIds.push(sentMsg.message_id);
@@ -761,8 +1081,16 @@ async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMs
             currentChunk += line + '\n';
         }
         if (currentChunk.trim().length > 0) {
-            const sentMsg = await replyWithRetry(currentChunk, false, buttons, 3, currentReplyId);
+            const sentMsg = await replyWithRetry(currentChunk, false, finalButtons, 3, currentReplyId);
             if (sentMsg) sentMsgIds.push(sentMsg.message_id);
+        }
+        if (sentMsgIds && sentMsgIds.length > 0) {
+            const lastMsgId = sentMsgIds[sentMsgIds.length - 1];
+            lastSentMessageIdMap.set(ctx.chat.id, {
+                messageId: lastMsgId,
+                chatId: ctx.chat.id,
+                baseKeyboard: buttons
+            });
         }
         console.log(`sendLongMessage: Sent successfully`);
         return sentMsgIds;
@@ -771,6 +1099,9 @@ async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMs
         return [];
     }
 }
+
+// Alias used by account/telegraph features (PR #21)
+const sendBotMessage = sendLongMessage;
 
 // Strip agent query echo from response text
 function stripQueryFromResponse(text, query) {
@@ -856,7 +1187,7 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-for (const command of ['task', 'cham', 'interaction', 'dongngay', 'tuan', 'focus']) {
+for (const command of ['task', 'cham', 'interaction', 'dongngay', 'tuan', 'focus', 'life', 'checklist']) {
     bot.command(command, async (ctx) => {
         const handled = await dailyLoop.handleText(ctx, ctx.message.text);
         if (!handled) await ctx.reply('Daily Loop đang tắt.');
@@ -903,6 +1234,9 @@ bot.help((ctx) => {
     if (topic === 'cursor') {
         return ctx.reply(getCursorHelpMessage(), { parse_mode: 'HTML' });
     }
+    if (topic === 'claude' || topic === 'claude-code' || topic === 'claudecode') {
+        return ctx.reply(getClaudeHelpMessage(), { parse_mode: 'HTML' });
+    }
     const helpMessage = `
 ${t('help.title')}
 
@@ -920,6 +1254,12 @@ ${t('help.ide_text')}
 
 ${t('help.chat_title')}
 ${t('help.chat_text')}
+
+${t('help.account_title')}
+${t('help.account_text')}
+
+🤖 <b>Claude Code</b> — <code>/help claude</code>
+💠 <b>Cursor Agent</b> — <code>/help cursor</code>
     `.trim();
     ctx.reply(helpMessage, { parse_mode: 'HTML' });
 });
@@ -1026,13 +1366,38 @@ bot.command('close_window', async (ctx) => {
     ctx.reply(resultMsg);
 });
 
+bot.command('closeall', async (ctx) => {
+    let closingMsg = await ctx.reply('🗂️ Closing all open file tabs...').catch(()=>{});
+    try {
+        const count = await closeAllEditors(CDP_PORT);
+        if (closingMsg && closingMsg.message_id) {
+            ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(`✅ Closed ${count} open file tab(s).`);
+    } catch (err) {
+        if (closingMsg && closingMsg.message_id) {
+            ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(`❌ Failed to close all tabs: ${err.message}`);
+    }
+});
+
 const handleStatus = async (ctx) => {
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
         let msg = '📊 <b>Claude Code (CLI) Status</b>\n\n';
         msg += `🤖 Model: <b>${typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : 'Default'}</b>\n`;
+        msg += `🧰 Binary: <code>${CLAUDE_BIN}</code>\n`;
         msg += `📁 Workspace: <code>${CLAUDE_WORK_DIR}</code>\n`;
-        const { isSessionActive } = require('./claude-controller');
+        const cInfo = getSessionInfo(String(ctx.chat.id));
+        msg += `📋 Session: <code>${cInfo.sessionId ? cInfo.sessionId.slice(0, 8) + '...' : 'new'}</code>\n`;
         msg += `⏳ Active Task: ${isSessionActive(String(ctx.chat.id)) ? 'Yes' : 'No'}\n`;
+        msg += `🛡️ Skip perms: <b>${CLAUDE_SKIP_PERMS ? 'ON' : 'OFF'}</b>\n`;
+        const lock = claudeCtrl.checkVaultLock(CLAUDE_WORK_DIR);
+        if (!lock.ok) {
+            msg += `🔒 Vault lock: <b>${lock.lockedBy}</b> (~${lock.ageMin}p)\n`;
+        } else {
+            msg += `🔓 Vault lock: free\n`;
+        }
         return ctx.reply(msg, { parse_mode: 'HTML' });
     }
     if (typeof currentEngine !== 'undefined' && currentEngine === 'cursor') {
@@ -1170,12 +1535,12 @@ async function buildMainMenu(overrideThread = null, overrideWorkspace = null, ta
 
     // --- Claude Code (CLI) ---
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
-        const cwDir = process.env.CLAUDE_WORK_DIR || process.env.HOME;
-        const cwName = shortLabel(path.basename(cwDir));
+        const cwName = shortLabel(path.basename(CLAUDE_WORK_DIR));
         const modelShort = shortLabel(currentClaudeModel || 'Model', 18);
         return Markup.keyboard([
             [`📁 ${cwName}`, `🧠 ${modelShort}`],
             ['📋 Session', '📊 Status'],
+            ['🆕 New session', '🔎 Ask mode'],
             ['🔀 Engine', '⏹ Stop']
         ]).resize();
     }
@@ -1272,7 +1637,7 @@ async function sendMainMenu(ctx, text = '🕹️ Kontrol Paneli:', overrideThrea
         const engineHint = currentEngine === 'cursor'
             ? '⌨️ Menu <b>Cursor</b> đã cập nhật.\n<i>Gõ /help cursor để xem giải thích từng nút.</i>'
             : currentEngine === 'claude'
-                ? '⌨️ Menu <b>Claude Code</b> đã cập nhật.'
+                ? '⌨️ Menu <b>Claude Code</b> đã cập nhật.\n<i>Gõ /help claude để xem giải thích từng nút.</i>'
                 : '⌨️ Menu <b>Antigravity</b> đã cập nhật.';
         return ctx.reply(engineHint, replyOpts);
     }
@@ -1297,12 +1662,12 @@ const handleLatest = async (ctx) => {
         // Use the preferred target (set by workspace switch or /window command)
         // instead of blindly picking candidates[0] which may be the wrong window
         const targetId = getPreferredTargetId() || null;
-        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId);
+        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, true);
         let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
         let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
         
         const header = await getChatHeader(targetId, t('latest.title'));
-        await sendLongMessage(ctx, text, header, buttons);
+        await sendBotMessage(ctx, text, header, buttons);
     } catch (err) {
         ctx.reply(t('latest.error', { error: err.message }));
     }
@@ -1386,7 +1751,7 @@ bot.command('ask', (ctx) => {
                     if (!text) text = t('ask.done_empty');
                     setReaction(ctx, null);
                     const header = await getChatHeader(null, t('ask.done'));
-                    await sendLongMessage(ctx, text, header, buttons);
+                    await sendBotMessage(ctx, text, header, buttons);
                 } else {
                     await ctx.reply(t('ask.timeout'));
                 }
@@ -1417,7 +1782,7 @@ bot.command('cmd', async (ctx) => {
         
         if (!output) output = t('cmd.no_output');
         
-        await sendLongMessage(ctx, output, t('cmd.output_title'));
+        await sendBotMessage(ctx, output, t('cmd.output_title'));
     });
 });
 
@@ -1498,8 +1863,21 @@ bot.hears(/^🆕/i, async (ctx) => {
     return ctx.reply(antiOnlyFeatureMsg());
 });
 bot.hears(/^🔎/i, async (ctx) => {
+    if (currentEngine === 'claude') {
+        return ctx.reply(
+            '🔎 <b>Ask mode (Claude read-only)</b>\n\n'
+            + 'Gõ: <code>/claude_ask [câu hỏi]</code>\n'
+            + '→ không ghi vault, không lấy <code>.nexmeos-lock</code>.\n\n'
+            + 'Agent ghi vault: plain text (engine Claude) hoặc <code>/claude …</code>.',
+            { parse_mode: 'HTML' }
+        );
+    }
     if (currentEngine !== 'cursor') {
-        return ctx.reply('🔎 Ask mode chỉ dùng với Cursor.\nGõ <code>/cursor_ask [câu hỏi]</code>', { parse_mode: 'HTML' });
+        return ctx.reply(
+            '🔎 Ask mode chỉ dùng với Cursor / Claude.\n'
+            + 'Gõ <code>/cursor_ask …</code> hoặc <code>/claude_ask …</code>',
+            { parse_mode: 'HTML' }
+        );
     }
     return ctx.reply(
         '🔎 <b>Ask mode (Cursor read-only)</b>\n\n'
@@ -1521,7 +1899,12 @@ bot.action('engine_claude', async (ctx) => {
     currentEngine = 'claude';
     saveEngine('claude');
     ctx.answerCbQuery('Switched to Claude Code');
-    await sendMainMenu(ctx, '🔀 Engine: <b>Claude Code (CLI)</b> ✅');
+    await sendMainMenu(ctx,
+        '🔀 Engine: <b>Claude Code (CLI)</b> ✅\n'
+        + `📁 <code>${CLAUDE_WORK_DIR}</code>\n`
+        + `🧠 Model: <code>${typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : 'default'}</code>\n\n`
+        + '<i>Gõ /help claude để xem menu Claude.</i>'
+    );
 });
 
 bot.action('engine_cursor', async (ctx) => {
@@ -1537,7 +1920,7 @@ bot.action('engine_cursor', async (ctx) => {
 });
 
 // ===== CLAUDE CODE QUERY HANDLER =====
-async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
+async function handleClaudeQuery(ctx, query, explicitSessionId = null, mode = null) {
     const chatId = String(ctx.chat.id);
     if (isSessionActive(chatId)) {
         return ctx.reply('⏳ Claude đang xử lý. /stop để huỷ.');
@@ -1545,14 +1928,15 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
 
     setReaction(ctx, REACTION.THINKING);
     const typingInterval = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
-    let statusMsg = await ctx.reply('⏳ Claude đang xử lý...', { parse_mode: 'HTML' });
+    const modeLabel = mode === 'ask' ? ' (ask/RO)' : '';
+    let statusMsg = await ctx.reply(`⏳ Claude đang xử lý${modeLabel}...`, { parse_mode: 'HTML' });
     let lastStatus = '';
     let toolCount = 0;
 
     try {
-        // Auto-resume latest session if none set
+        // Auto-resume latest session if none set (agent mode only — ask keeps current/explicit)
         let sessionId = explicitSessionId || getLastSessionId(chatId);
-        if (!sessionId) {
+        if (!sessionId && mode !== 'ask') {
             const latest = getLatestSessionId(CLAUDE_WORK_DIR);
             if (latest) { sessionId = latest; setActiveSession(chatId, latest); }
         }
@@ -1561,12 +1945,13 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
             chatId,
             workDir: CLAUDE_WORK_DIR,
             skipPermissions: CLAUDE_SKIP_PERMS,
-            resumeSessionId: sessionId,
+            resumeSessionId: sessionId || undefined,
             model: typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : undefined,
+            mode: mode || undefined,
             onEvent: (event) => {
                 let newStatus = null;
                 if (event.type === 'system' && event.subtype === 'init') {
-                    newStatus = '🔌 Connected. Thinking...';
+                    newStatus = `🔌 Claude connected${event.model ? ` · ${event.model}` : ''}${modeLabel}`;
                 } else if (event.type === 'assistant' && event.message?.content) {
                     for (const block of event.message.content) {
                         if (block.type === 'tool_use') {
@@ -1576,6 +1961,7 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
                             let detail = '';
                             if (toolName === 'Bash' && input.command) detail = `: ${input.command.slice(0, 40)}`;
                             else if (input.file_path) detail = `: ${path.basename(input.file_path)}`;
+                            else if (input.path) detail = `: ${path.basename(input.path)}`;
                             newStatus = `🛠 [${toolCount}] ${toolName}${detail}`;
                         }
                     }
@@ -1595,9 +1981,10 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
         if (!result.text) return ctx.reply('⚠️ Response rỗng.');
 
         const footer = `\n\n⏱ ${(result.duration / 1000).toFixed(1)}s` +
-            (result.toolsUsed.length ? ` | 🛠 ${result.toolsUsed.join(', ')}` : '');
+            (result.toolsUsed.length ? ` | 🛠 ${result.toolsUsed.slice(0, 8).join(', ')}` : '');
 
-        const sentIds = await sendLongMessage(ctx, result.text + footer, '🤖 Claude Code');
+        const header = mode === 'ask' ? '🤖 Claude Code (ask/RO)' : '🤖 Claude Code';
+        const sentIds = await sendLongMessage(ctx, result.text + footer, header);
         if (sentIds && sentIds.length > 0 && result.sessionId) {
             sentIds.forEach(id => messageTargetMap.set(id, { claudeSessionId: result.sessionId }));
             saveMessageTargetMap(messageTargetMap);
@@ -1610,6 +1997,42 @@ async function handleClaudeQuery(ctx, query, explicitSessionId = null) {
         ctx.reply(`❌ ${err.message}`);
     }
 }
+
+bot.command('claude', async (ctx) => {
+    const text = (ctx.message.text || '').replace(/^\/claude(@\w+)?\s*/i, '').trim();
+    if (!text) {
+        return ctx.reply(
+            '🤖 <b>Claude Code</b>\n' +
+            `📁 <code>${CLAUDE_WORK_DIR}</code>\n` +
+            `🧠 Model: <code>${typeof currentClaudeModel !== 'undefined' ? currentClaudeModel : 'default'}</code>\n` +
+            `🧰 <code>${CLAUDE_BIN}</code>\n` +
+            `🛡️ Skip perms: <b>${CLAUDE_SKIP_PERMS ? 'ON' : 'OFF'}</b>\n\n` +
+            'Cách dùng:\n' +
+            '• <code>/claude [prompt]</code> — agent (có ghi vault + lock)\n' +
+            '• <code>/claude_ask [prompt]</code> — read-only\n' +
+            '• <code>/claude_new</code> — reset session Claude\n' +
+            '• <code>/session</code> — chọn session gần đây\n' +
+            '• <code>/help claude</code> — giải thích menu Claude\n' +
+            '• <code>/engine</code> → Claude → mọi text đi Claude\n' +
+            '• Reply tin Claude để resume session',
+            { parse_mode: 'HTML' }
+        );
+    }
+    return handleClaudeQuery(ctx, text, null, null);
+});
+
+bot.command('claude_ask', async (ctx) => {
+    const text = (ctx.message.text || '').replace(/^\/claude_ask(@\w+)?\s*/i, '').trim();
+    if (!text) {
+        return ctx.reply('Dùng: <code>/claude_ask [câu hỏi]</code> — Claude read-only, không ghi vault.', { parse_mode: 'HTML' });
+    }
+    return handleClaudeQuery(ctx, text, null, 'ask');
+});
+
+bot.command('claude_new', async (ctx) => {
+    resetSession(String(ctx.chat.id));
+    ctx.reply('🆕 Claude session reset. Tin nhắn tiếp theo tạo chat mới.');
+});
 
 // ===== CURSOR AGENT QUERY HANDLER =====
 async function handleCursorQuery(ctx, query, explicitSessionId = null, mode = null) {
@@ -2192,6 +2615,70 @@ bot.command('new', async (ctx) => {
     }
 });
 
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+async function renderAndSendAgentThreads(ctx, port) {
+    const workspaces = await listAgentThreads(port);
+    if (!workspaces || workspaces.length === 0) {
+        return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+    }
+    
+    cachedAgentThreads = [];
+    const chunks = [];
+    let currentChunk = t('agents.list_title') || '📂 <b>Recent Chat Threads:</b>\n\n';
+    let index = 1;
+    
+    for (const ws of workspaces) {
+        const recentThreads = ws.threads.filter(th => {
+            if (!th.name) return false;
+            if (/^show\s+\d+\s+more/i.test(th.name)) return false;
+            if (/^(Ran|Worked for|Explored)\b/i.test(th.name)) return false;
+            return true;
+        }).slice(0, 5);
+        
+        if (recentThreads.length > 0) {
+            let sectionText = `<b>📁 ${escapeHtml(ws.workspace)}</b>\n`;
+            for (const th of recentThreads) {
+                cachedAgentThreads.push({ ...th, workspace: ws.workspace });
+                let cleanName = th.name.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+                if (cleanName.length > 50) cleanName = cleanName.substring(0, 47) + '...';
+                const safeName = escapeHtml(cleanName);
+                const safeTime = escapeHtml(th.time);
+                sectionText += `  /agents_${index} - ${safeName} <i>(${safeTime})</i>\n`;
+                index++;
+            }
+            sectionText += '\n';
+            
+            if ((currentChunk + sectionText).length > 3500) {
+                chunks.push(currentChunk);
+                currentChunk = sectionText;
+            } else {
+                currentChunk += sectionText;
+            }
+        }
+    }
+    
+    if (currentChunk.trim().length > 0) {
+        chunks.push(currentChunk);
+    }
+    
+    if (cachedAgentThreads.length === 0) {
+        return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+    }
+    
+    for (const chunk of chunks) {
+        await ctx.reply(chunk, { parse_mode: 'HTML' });
+    }
+}
+
 bot.command('agents', async (ctx) => {
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
         return ctx.reply(t('feature.claude_unsupported') || '❌ This feature is currently only available in Antigravity mode.');
@@ -2202,7 +2689,7 @@ bot.command('agents', async (ctx) => {
     if (!isNaN(num)) {
         if (num > 0 && num <= cachedAgentThreads.length) {
             const thread = cachedAgentThreads[num - 1];
-            const success = await switchAgentThread(CDP_PORT, thread.name);
+            const success = await switchAgentThread(CDP_PORT, thread.name, thread.workspace);
             if (!success) {
                 ctx.reply(t('agents.not_found') || '❌ Thread could not be selected.');
             } else {
@@ -2219,38 +2706,7 @@ bot.command('agents', async (ctx) => {
     }
     
     try {
-        const workspaces = await listAgentThreads(CDP_PORT);
-        if (workspaces.length === 0) {
-            return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
-        }
-        
-        cachedAgentThreads = [];
-        let msg = t('agents.list_title') || '📂 <b>Recent Chat Threads:</b>\\n\\n';
-        let index = 1;
-        
-        for (const ws of workspaces) {
-            const recentThreads = ws.threads.filter(th => {
-                // Skip the "Show N more..." load-more button
-                if (/^show\s+\d+\s+more/i.test(th.name)) return false;
-                return true;
-            });
-            
-            if (recentThreads.length > 0) {
-                msg += `<b>📁 ${ws.workspace}</b>\n`;
-                for (const th of recentThreads) {
-                    cachedAgentThreads.push({ ...th, workspace: ws.workspace });
-                    msg += `  /agents_${index} - ${th.name} <i>(${th.time})</i>\n`;
-                    index++;
-                }
-                msg += '\n';
-            }
-        }
-        
-        if (cachedAgentThreads.length === 0) {
-            return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
-        }
-        
-        ctx.reply(msg, { parse_mode: 'HTML' });
+        await renderAndSendAgentThreads(ctx, CDP_PORT);
     } catch (e) {
         ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
     }
@@ -2279,13 +2735,246 @@ bot.hears(/^\/agents_(\d+)$/, async (ctx) => {
     }
 });
 
+bot.hears(/^(\d+)$/, async (ctx, next) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (cachedAgentThreads.length > 0 && num > 0 && num <= cachedAgentThreads.length) {
+        const thread = cachedAgentThreads[num - 1];
+        const targetId = await switchAgentThread(CDP_PORT, thread.name, thread.workspace);
+        if (!targetId) {
+            ctx.reply(t('agents.not_found') || '❌ Thread could not be selected.');
+        } else {
+            setPreferredWindow(null);
+            if (thread.workspace) {
+                setActiveWorkspace(thread.workspace);
+            }
+            await snapshotChatState(CDP_PORT, targetId, thread.name).catch(() => {});
+            await sendMainMenu(ctx, t('agents.switched_plain', { name: thread.name }), thread.name, thread.workspace);
+        }
+        return;
+    }
+    return next();
+});
+
+const lastUploadedMtimes = new Map();
+let artifactWatchers = new Map();
+const artifactDebounceTimers = new Map();
+
+function getArtifactButtons(conversationId) {
+    if (!conversationId) return [];
+
+    const driver = DriverFactory.getDriver();
+    const conversationDir = driver.getConversationDir(conversationId);
+
+    if (!fs.existsSync(conversationDir)) return [];
+
+    const mdFiles = [];
+    
+    // Scan root of conversationDir
+    try {
+        const rootFiles = fs.readdirSync(conversationDir);
+        for (const f of rootFiles) {
+            if (f.endsWith('.md')) {
+                mdFiles.push({ name: f, path: path.join(conversationDir, f) });
+            }
+        }
+    } catch (e) {}
+
+    // Scan artifacts subdirectory
+    const artifactsDir = path.join(conversationDir, 'artifacts');
+    if (fs.existsSync(artifactsDir)) {
+        try {
+            const artFiles = fs.readdirSync(artifactsDir);
+            for (const f of artFiles) {
+                if (f.endsWith('.md')) {
+                    mdFiles.push({ name: f, path: path.join(artifactsDir, f) });
+                }
+            }
+        } catch (e) {}
+    }
+
+    const titleMap = {
+        'task.md': '📋 Task',
+        'implementation_plan.md': '🗒️ Plan',
+        'walkthrough.md': '📖 Walkthrough'
+    };
+
+    const buttons = [];
+    for (const file of mdFiles) {
+        const mapping = telegraphPublisher.getPageMapping(file.path);
+        if (mapping && mapping.url) {
+            let label = titleMap[file.name];
+            if (!label) {
+                const defaultTitle = file.name.replace(/\.md$/, '').replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                label = `📄 ${defaultTitle}`;
+            }
+            // Avoid duplicate buttons if the same file is somehow pushed twice
+            if (!buttons.some(b => b.url === mapping.url)) {
+                buttons.push({ text: label, url: mapping.url });
+            }
+        }
+    }
+
+    // Chunk buttons into rows of 2
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 2) {
+        rows.push(buttons.slice(i, i + 2));
+    }
+    
+    return rows;
+}
+
+function watchArtifacts(conversationId, retry = 0) {
+    if (!conversationId) return;
+
+    const driver = DriverFactory.getDriver();
+    const conversationDir = driver.getConversationDir(conversationId);
+
+    if (artifactWatchers.has(conversationDir)) return; // Already watching this folder!
+
+    if (!fs.existsSync(conversationDir)) {
+        if (retry < 5) {
+            setTimeout(() => watchArtifacts(conversationId, retry + 1), 2000);
+        }
+        return;
+    }
+
+    const isWatchable = (name) => name.endsWith('.md');
+
+    try {
+        const watcher = fs.watch(conversationDir, { recursive: true }, (eventType, filename) => {
+            if (!filename) return;
+            const normalizedFilename = filename.split(/[/\\]/).pop();
+            if (isWatchable(normalizedFilename)) {
+                let filePath = path.join(conversationDir, filename);
+
+                if (artifactDebounceTimers.has(filePath)) {
+                    clearTimeout(artifactDebounceTimers.get(filePath));
+                }
+
+                const timer = setTimeout(async () => {
+                    artifactDebounceTimers.delete(filePath);
+
+                    // Resolve the real path — on Windows, fs.watch may report only the basename
+                    // while the file actually lives in the artifacts/ subdirectory (or vice-versa)
+                    let resolvedFilePath = filePath;
+                    if (!fs.existsSync(resolvedFilePath)) {
+                        const fallbackRoot = path.join(conversationDir, normalizedFilename);
+                        const fallbackArtifacts = path.join(conversationDir, 'artifacts', normalizedFilename);
+                        if (fs.existsSync(fallbackRoot)) {
+                            resolvedFilePath = fallbackRoot;
+                        } else if (fs.existsSync(fallbackArtifacts)) {
+                            resolvedFilePath = fallbackArtifacts;
+                        } else {
+                            return;
+                        }
+                    }
+
+                    try {
+                        const stat = fs.statSync(resolvedFilePath);
+                        const lastMtime = lastUploadedMtimes.get(resolvedFilePath);
+                        if (lastMtime && stat.mtimeMs <= lastMtime) {
+                            return;
+                        }
+                        lastUploadedMtimes.set(resolvedFilePath, stat.mtimeMs);
+
+                        console.log(`[Telegraph Watcher] Detected update for ${normalizedFilename}, uploading...`);
+                        const title = normalizedFilename.replace(/\.md$/, '').replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                        const url = await telegraphPublisher.publishOrUpdateArtifact(resolvedFilePath, title);
+                        if (url) {
+                            console.log(`[Telegraph Watcher] Published ${normalizedFilename} to ${url}`);
+                            
+                            // Send/update Telegram message with link
+                            const lastMsg = lastSentMessageIdMap.get('current') || Array.from(lastSentMessageIdMap.values()).pop();
+                            if (lastMsg && lastMsg.messageId) {
+                                const lookupChatId = lastMsg.chatId;
+                                const inlineKeyboard = getArtifactButtons(conversationId);
+                                const res = await bot.telegram.editMessageReplyMarkup(lookupChatId, lastMsg.messageId, undefined, {
+                                    inline_keyboard: inlineKeyboard
+                                }).catch(err => {
+                                    console.error('[Telegraph Watcher] Failed to update message keyboard:', err.message);
+                                });
+                                if (res && typeof res === 'object') {
+                                    lastSentMessageIdMap.set(lookupChatId, { ...lastMsg, baseKeyboard: { ...lastMsg.baseKeyboard, reply_markup: { inline_keyboard: inlineKeyboard } } });
+                                }
+                            } else {
+                                const msg = `📝 <b>${title} Updated!</b>\n\nRead on Telegraph:\n${url}`;
+                                for (const chatId of ALLOWED_CHAT_IDS) {
+                                    bot.telegram.sendMessage(chatId, msg, { 
+                                        parse_mode: 'HTML',
+                                        reply_markup: { inline_keyboard: [[{ text: '🌐 Open Artifact', url: url }]] }
+                                    }).catch(err => {
+                                        console.error(`[Telegraph Watcher] Failed to send message to ${chatId}:`, err.message);
+                                    });
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        console.error(`[Telegraph Watcher] Error processing artifact ${normalizedFilename}:`, err.stack);
+                    }
+                }, 3000);
+
+                artifactDebounceTimers.set(filePath, timer);
+            }
+        });
+        artifactWatchers.set(conversationDir, watcher);
+        console.log(`[Telegraph Watcher] Watching artifacts for directory: ${conversationDir}`);
+    } catch (e) {
+        console.error('[Telegraph Watcher] Failed to start watcher:', e.message);
+    }
+}
+
+
+
+async function handleGetArtifactCommand(ctx, fileName, title) {
+    try {
+        const conversationId = getLastResolvedThreadId();
+        if (!conversationId) {
+            return ctx.reply(`⚠️ No active thread found. Please select a thread in the IDE first.`);
+        }
+
+        const driver = DriverFactory.getDriver();
+        const conversationDir = driver.getConversationDir(conversationId);
+
+        let filePath = path.join(conversationDir, fileName);
+        if (!fs.existsSync(filePath)) {
+            filePath = path.join(conversationDir, 'artifacts', fileName);
+        }
+
+        if (!fs.existsSync(filePath)) {
+            return ctx.reply(`⚠️ <b>${title}</b> is not available for this chat yet.`, { parse_mode: 'HTML' });
+        }
+
+        const pathId = getPathId(filePath);
+        const buttons = [];
+        const row = [];
+        
+        const mapping = telegraphPublisher.getPageMapping(filePath);
+        if (mapping && mapping.url) {
+            row.push({ text: `🌐 Open ${title}`, url: mapping.url });
+        }
+        row.push({ text: `📄 Get File`, callback_data: `ff_${pathId}` });
+        buttons.push(row);
+
+        ctx.reply(`📝 <b>${title}</b> for current chat:`, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        });
+    } catch (e) {
+        ctx.reply(`❌ Error getting ${title}: ` + e.message);
+    }
+}
+
+bot.command('gettask', ctx => handleGetArtifactCommand(ctx, 'task.md', 'Task Checklist'));
+bot.command('getplan', ctx => handleGetArtifactCommand(ctx, 'implementation_plan.md', 'Implementation Plan'));
+bot.command('getwalk', ctx => handleGetArtifactCommand(ctx, 'walkthrough.md', 'Walkthrough'));
+
 const handleArtifacts = async (ctx) => {
     if (typeof currentEngine !== 'undefined' && currentEngine !== 'antigravity') {
         return ctx.reply(antiOnlyFeatureMsg());
     }
     try {
-        const appDataName = (process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') === 'ide' ? 'antigravity-ide' : 'antigravity';
-        const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+        const driver = DriverFactory.getDriver();
+        const brainPath = driver.brainPath;
         
         // Helper to check if a file should be listed as an artifact
         const ARTIFACT_EXTENSIONS = ['.md', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.gif', '.pdf', '.txt', '.json', '.csv', '.html'];
@@ -2302,8 +2991,25 @@ const handleArtifacts = async (ctx) => {
         try { threadInfo = await getActiveThreadInfo(CDP_PORT, getPreferredTargetId()); } catch (_) {}
         const workspaceName = threadInfo?.workspace?.split(' - ')?.[0]?.trim()?.toLowerCase() || null;
         
-        // Strategy: Try known thread ID first, then scan all conversations
+        // Strategy: Try known thread ID first, then active thread from DOM, then scan all conversations
         let conversationId = getLastResolvedThreadId();
+        
+        if (!conversationId) {
+            // Force resolution of the active thread if not already set (e.g. immediately after a restart)
+            try { 
+                conversationId = await getActiveThreadId(CDP_PORT, getPreferredTargetId());
+                if (conversationId) {
+                    // Update the cached thread ID so we don't have to query the DOM again
+                    setLastResolvedThreadId(conversationId);
+                }
+            } catch (_) {}
+            
+            if (!conversationId) {
+                try { await getFullLatestResponse(CDP_PORT, getPreferredTargetId()); } catch (_) {}
+                conversationId = getLastResolvedThreadId();
+            }
+        }
+
         let conversationDir = conversationId ? path.join(brainPath, conversationId) : null;
         
         // Quick check: does this conversation actually have RECENT artifacts?
@@ -2336,10 +3042,9 @@ const handleArtifacts = async (ctx) => {
         }
         
         // If no artifacts found via lastResolvedThreadId, scan ALL conversations
-        // filtered by workspace name, sorted by most recently modified
+        // sorted by most recently modified
         if (!hasArtifacts && fs.existsSync(brainPath)) {
-            console.log(`[handleArtifacts] lastResolvedThreadId ${conversationId?.substring(0, 8) || 'null'} has no artifacts — scanning brain...`);
-            const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+            console.log(`[handleArtifacts] lastResolvedThreadId ${conversationId?.substring(0, 8) || 'null'} has no artifacts — scanning brain for most recent...`);
             const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
                 .filter(d => d.isDirectory())
                 .map(d => {
@@ -2359,18 +3064,9 @@ const handleArtifacts = async (ctx) => {
                                         fs.existsSync(path.join(dir.dir, 'artifacts'));
                 if (!dirHasArtifacts) continue;
                 
-                // If we have a workspace filter, check that the transcript mentions this workspace
-                if (workspaceName) {
-                    const tp = path.join(dir.dir, '.system_generated', 'logs', 'transcript.jsonl');
-                    try {
-                        const head = fs.readFileSync(tp, 'utf8').substring(0, 5000);
-                        if (!normalize(head).includes(normalize(workspaceName))) continue;
-                    } catch (_) { continue; }
-                }
-                
                 conversationId = dir.name;
                 conversationDir = dir.dir;
-                console.log(`[handleArtifacts] Found artifacts in conversation ${dir.name.substring(0, 8)} (workspace: ${workspaceName || 'any'})`);
+                console.log(`[handleArtifacts] Found artifacts in most recent conversation ${dir.name.substring(0, 8)}`);
                 break;
             }
         }
@@ -2435,7 +3131,8 @@ const handleArtifacts = async (ctx) => {
         // Sort by modification time, newest first
         cachedArtifacts.sort((a, b) => b.mtime - a.mtime);
 
-        let msg = t('artifacts.list_title') || '📎 <b>Artifacts for Current Thread:</b>\\n\\n';
+        let msg = t('artifacts.list_title') || '📎 <b>Artifacts for Current Thread:</b>\n\n';
+        const msgs = [];
         for (let i = 0; i < cachedArtifacts.length; i++) {
             const filename = cachedArtifacts[i].name;
             let displayName = filename;
@@ -2458,10 +3155,26 @@ const handleArtifacts = async (ctx) => {
             } else {
                 displayName = filename.replace(/\.[^/.]+$/, "").replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
             }
-            msg += `/artifact_${i + 1} - ${displayName}\n`;
+            let line = `/artifact_${i + 1} - ${displayName}`;
+            const mapping = telegraphPublisher.getPageMapping(cachedArtifacts[i].path);
+            if (mapping && mapping.url) {
+                line += ` [🌐 <a href="${mapping.url}">Telegraph</a>]`;
+            }
+            line += '\n';
+            if (msg.length + line.length > 4000) {
+                msgs.push(msg);
+                msg = line;
+            } else {
+                msg += line;
+            }
+        }
+        if (msg) {
+            msgs.push(msg);
         }
         
-        ctx.reply(msg, { parse_mode: 'HTML' });
+        for (const m of msgs) {
+            await ctx.reply(m, { parse_mode: 'HTML' });
+        }
     } catch (e) {
         ctx.reply((t('artifacts.error') || '❌ Error reading artifact: ') + e.message);
     }
@@ -2484,7 +3197,7 @@ bot.hears(/^\/artifact_(\d+)$/, async (ctx) => {
                 await ctx.replyWithVideo({ source: artifact.path });
             } else if (ext === '.md') {
                 const content = fs.readFileSync(artifact.path, 'utf8');
-                await sendLongMessage(ctx, content);
+                await sendBotMessage(ctx, content);
             } else {
                 await ctx.replyWithDocument({ source: artifact.path });
             }
@@ -2605,7 +3318,7 @@ const handleModel = async (ctx) => {
         console.error('Failed to get dynamic models:', e.message);
     }
 
-    if (!models || models.length === 0) {
+    if (!models || models.length <= 1) {
         models = [
             'Gemini 3.5 Flash (Medium)',
             'Gemini 3.5 Flash (High)',
@@ -2974,6 +3687,12 @@ bot.action('aa_status', async (ctx) => {
 // ===== WORKSPACE =====
 
 async function doLaunchWorkspace(ctx, workspace) {
+    try {
+        ensureMemoryConvention(workspace);
+    } catch (e) {
+        console.debug('[memory_convention] skipped:', e.message);
+    }
+
     let switchingMsg;
     if (ctx.callbackQuery && ctx.callbackQuery.message) {
         try {
@@ -3037,6 +3756,63 @@ async function doLaunchWorkspace(ctx, workspace) {
                     console.debug('[doLaunchWorkspace] Standalone launch and switch failed:', e.message);
                 }
             }
+
+            // Fallback: Directly launch the Standalone App pointing to the workspace folder
+            try {
+                await launchIDE(workspace, CDP_PORT, 'agent');
+                setActiveWorkspace(wsName);
+                
+                // Poll CDP until the Standalone App window is responsive (max 30 seconds)
+                let cdpReady = false;
+                for (let i = 0; i < 15; i++) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    try {
+                        const http = require('http');
+                        const targets = await new Promise((resolve, reject) => {
+                            http.get(`http://127.0.0.1:${CDP_PORT}/json`, (res) => {
+                                let data = '';
+                                res.on('data', chunk => data += chunk);
+                                res.on('end', () => {
+                                    try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+                                });
+                            }).on('error', reject);
+                        });
+                        if (targets && targets.length > 0) {
+                            const targetWsName = wsName.toLowerCase();
+                            const foundNew = targets.some(t => t.title && t.title.toLowerCase().includes(targetWsName));
+                            if (foundNew) {
+                                cdpReady = true;
+                                break;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                
+                if (cdpReady) {
+                    const successMsg = t('workspace.started', { workspace });
+                    if (switchingMsg && switchingMsg.message_id) {
+                        ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                    }
+                    setPreferredWindow(null);
+                    if (autoaccept.isEnabled) {
+                        autoaccept.enable(CDP_PORT).catch(() => {});
+                    }
+                    await triggerNewChat(CDP_PORT);
+                    await sendMainMenu(ctx, successMsg);
+                    return;
+                } else {
+                    const successMsg = (t('workspace.started', { workspace }) || '📁 Workspace switched successfully!') + (t('workspace.cdp_warning') || '\n⚠️ CDP not ready yet, but IDE was started.');
+                    if (switchingMsg && switchingMsg.message_id) {
+                        ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                    }
+                    setPreferredWindow(null);
+                    await sendMainMenu(ctx, successMsg);
+                    return;
+                }
+            } catch (fallbackErr) {
+                console.error('[doLaunchWorkspace] Standalone direct launch fallback failed:', fallbackErr);
+            }
+
             await sendMainMenu(ctx, t('workspace.not_found_standalone', { wsName }));
             return;
         }
@@ -3157,6 +3933,7 @@ const handleWorkspace = (ctx) => {
     
     currentWorkspaceDir = wsPath;
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        CLAUDE_WORK_DIR = wsPath;
         updateEnvFile('CLAUDE_WORK_DIR', wsPath);
         resetSession(String(ctx.chat.id));
         ctx.reply(`✅ Đã chuyển thư mục làm việc của Claude Code sang:\n<code>${wsPath}</code>\n\n(Session cũ đã được reset để bắt đầu trong thư mục mới)`, { parse_mode: 'HTML' });
@@ -3182,6 +3959,7 @@ bot.action(/ws_(.+)/, (ctx) => {
     currentWorkspaceDir = wsPath;
     ctx.answerCbQuery(t('workspace.selected', { project }));
     if (typeof currentEngine !== 'undefined' && currentEngine === 'claude') {
+        CLAUDE_WORK_DIR = wsPath;
         updateEnvFile('CLAUDE_WORK_DIR', wsPath);
         resetSession(String(ctx.chat.id));
         let msg = `✅ Đã chuyển thư mục làm việc của Claude Code sang:\n<code>${wsPath}</code>\n\n(Session cũ đã được reset để bắt đầu trong thư mục mới)`;
@@ -3207,6 +3985,61 @@ bot.action(/ws_(.+)/, (ctx) => {
         return;
     }
     doLaunchWorkspace(ctx, wsPath);
+});
+
+// ===== PROJECT MEMORY =====
+bot.command('memory', async (ctx) => {
+    const { CANDIDATE_FILES } = require('./memory_convention');
+    const fs = require('fs');
+    const path = require('path');
+    
+    if (!currentWorkspaceDir || currentWorkspaceDir === config.projectsDir) {
+        return ctx.reply('Lütfen önce bir proje (workspace) seçin. Örnek: /workspace antigravity-bot');
+    }
+
+    const args = ctx.message.text.split(' ').slice(1);
+    const cmd = args[0] ? args[0].toLowerCase() : null;
+
+    if (cmd === 'off') {
+        process.env.AUTO_MEMORY_CONVENTION = 'false';
+        return ctx.reply('Project Memory özelliği bu oturum için geçici olarak kapatıldı.');
+    } else if (cmd === 'on') {
+        process.env.AUTO_MEMORY_CONVENTION = 'true';
+        return ctx.reply('Project Memory özelliği bu oturum için aktif edildi.');
+    }
+
+    const isActive = process.env.AUTO_MEMORY_CONVENTION === 'true';
+    let msg = `Project Memory Durumu:\n\n`;
+    msg += `Durum: ${isActive ? 'Aktif' : 'Kapalı'}\n`;
+    msg += `Aktif Proje: ${path.basename(currentWorkspaceDir)}\n\n`;
+
+    const existingFiles = [];
+    for (const name of CANDIDATE_FILES) {
+        const p = path.join(currentWorkspaceDir, name);
+        if (fs.existsSync(p)) {
+            existingFiles.push(name);
+        }
+    }
+
+    const buttons = [];
+    if (existingFiles.length > 0) {
+        msg += `Hafıza Dosyaları (Aşağıdan tıklayıp okuyabilirsin):`;
+        for (const f of existingFiles) {
+            const p = path.join(currentWorkspaceDir, f);
+            const pathId = getPathId(p);
+            buttons.push([{ text: `📄 ${f}`, callback_data: `ff_${pathId}` }]);
+        }
+    } else {
+        msg += `Projede AGENT.md veya GEMINI.md bulunamadı.`;
+    }
+
+    msg += `\n\nKapatmak için: /memory off\nAçmak için: /memory on`;
+    
+    if (buttons.length > 0) {
+        ctx.reply(msg, { reply_markup: { inline_keyboard: buttons } });
+    } else {
+        ctx.reply(msg);
+    }
 });
 
 // ===== LANGUAGE SWITCH =====
@@ -3290,9 +4123,14 @@ bot.command('app', async (ctx) => {
 
 bot.action(/pref_app_(.+)/, async (ctx) => {
     const selectedApp = ctx.match[1]; // 'agent' or 'ide'
+    const oldApp = selectedApp === 'ide' ? 'agent' : 'ide';
+    
     const success = updateEnvFile('ANTIGRAVITY_PREFERRED_APP', selectedApp);
     
     if (success) {
+        // Eski uygulamayı güvenli bir şekilde kapat (UI'ı bloklamadan arka planda)
+        const killPromise = killIDE(oldApp).catch(e => console.error('[App Switch] Failed to kill old app:', e.message));
+        
         // Recalculate port
         CDP_PORT = getCDPPort();
         ctx.answerCbQuery(t('app.updated_preference', { app: selectedApp }));
@@ -3306,14 +4144,16 @@ bot.action(/pref_app_(.+)/, async (ctx) => {
         ctx.reply(msg, { parse_mode: 'HTML' });
         
         // Seçilen uygulama açık değilse otomatik başlat
+        let autoStarted = false;
         try {
             const running = await isIDERunning(selectedApp);
             if (!running) {
                 ctx.reply(t('app.auto_starting', { appName }));
+                await killPromise; // Race condition önlemi: Eski uygulamanın tamamen kapandığından emin ol
                 await launchIDE(null, CDP_PORT, selectedApp);
                 // Uygulamanın açılması için biraz bekle
                 await new Promise(r => setTimeout(r, 4000));
-                ctx.reply(t('app.started', { appName }));
+                autoStarted = true;
             }
         } catch (err) {
             console.error('[App Switch] Auto-start failed:', err.message);
@@ -3324,7 +4164,11 @@ bot.action(/pref_app_(.+)/, async (ctx) => {
             autoaccept.enable(CDP_PORT).catch(() => {});
         }
         
-        await sendMainMenu(ctx, t('app.control_panel', { app: selectedApp === 'ide' ? 'IDE' : 'Agent' }));
+        if (autoStarted) {
+            await sendMainMenu(ctx, t('app.started', { appName }));
+        } else {
+            await sendMainMenu(ctx, t('app.control_panel', { app: selectedApp === 'ide' ? 'IDE' : 'Agent' }));
+        }
     } else {
         ctx.answerCbQuery(t('app.error_save'));
     }
@@ -3578,7 +4422,7 @@ bot.action(/wn_(.+)/, (ctx) => {
             
             if (text && !text.startsWith('[No previous')) {
                 const header = await getChatHeader(null, t('latest.last_agent_reply'));
-                await sendLongMessage(ctx, text, header, buttons);
+                await sendBotMessage(ctx, text, header, buttons);
             }
         } catch(_) {}
     })();
@@ -3782,8 +4626,10 @@ function getMenuCommands() {
         { command: 'artifacts', description: t('menu.artifacts_desc') },
         { command: 'model', description: t('menu.model_desc') },
         { command: 'workspace', description: t('menu.workspace_desc') },
+        { command: 'memory', description: 'Check or toggle Project Memory' },
         { command: 'window', description: t('menu.window_desc') || 'Select IDE window' },
         { command: 'close_window', description: t('menu.close_window_desc') || 'Close current window' },
+        { command: 'closeall', description: t('menu.closeall_desc') || 'Close all open file tabs' },
         { command: 'lang', description: t('menu.lang_desc') },
         { command: 'cmd', description: t('menu.cmd_desc') },
         { command: 'file', description: t('menu.file_desc') },
@@ -3802,7 +4648,15 @@ function getMenuCommands() {
         { command: 'schedule_setup', description: t('schedule.menu_schedule_setup_desc') || 'Setup CronCrew connection' },
         { command: 'schedule_list', description: t('schedule.menu_schedule_list_desc') || 'List scheduled tasks' },
         { command: 'schedule_add', description: t('schedule.menu_schedule_add_desc') || 'Add a new schedule' },
-        { command: 'schedule_status', description: t('schedule.menu_schedule_status_desc') || 'Show CronCrew status' }
+        { command: 'schedule_status', description: t('schedule.menu_schedule_status_desc') || 'Show CronCrew status' },
+        { command: 'login', description: t('menu.login_desc') || 'Sign in with Google' },
+        { command: 'accounts', description: t('menu.accounts_desc') || 'List saved Google accounts' },
+        { command: 'switchacc', description: t('menu.switchacc_desc') || 'Switch active Google account' },
+        { command: 'getinfo', description: t('menu.getinfo_desc') || 'View account quota info' },
+        { command: 'delacc', description: t('menu.delacc_desc') || 'Delete a saved Google account' },
+        { command: 'gettask', description: t('menu.gettask_desc') || 'Get the latest Task Checklist' },
+        { command: 'getplan', description: t('menu.getplan_desc') || 'Get the latest Implementation Plan' },
+        { command: 'getwalk', description: t('menu.getwalk_desc') || 'Get the latest Walkthrough' }
     ];
     return cmds.sort((a, b) => a.command.localeCompare(b.command));
 }
@@ -3931,7 +4785,10 @@ bot.command('update', async (ctx) => {
             t('update.updating'),
             { parse_mode: 'HTML' }
         );
-        const updateResult = await updater.performUpdate();
+        const updateResult = await updater.performUpdate((err2) => {
+            const pmId = process.env.pm_id || 'antigravity-telegram-suite';
+            ctx.reply(`⚠️ Failed to restart automatically.\nPM2 Error: <code>${err2.message}</code>\n\nPlease run manually:\n<code>pm2 restart ${pmId}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        });
         await ctx.reply(`ℹ️ ${updateResult.message}`);
     } catch(e) {
         ctx.reply(t('update.error', { error: e.message }));
@@ -4009,37 +4866,7 @@ bot.hears(/^🤖/i, async (ctx) => {
     
     // 🤖 butonu aktif ajanı gösteriyor — tıklanınca /agents listesini tetikle
     try {
-        const workspaces = await listAgentThreads(CDP_PORT);
-        if (workspaces.length === 0) {
-            return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
-        }
-        
-        cachedAgentThreads = [];
-        let msg = t('agents.list_title') || '📂 <b>Recent Chat Threads:</b>\n\n';
-        let index = 1;
-        
-        for (const ws of workspaces) {
-            const recentThreads = ws.threads.filter(th => {
-                if (/^show\s+\d+\s+more/i.test(th.name)) return false;
-                return true;
-            });
-            
-            if (recentThreads.length > 0) {
-                msg += `<b>📁 ${ws.workspace}</b>\n`;
-                for (const th of recentThreads) {
-                    cachedAgentThreads.push({ ...th, workspace: ws.workspace });
-                    msg += `  /agents_${index} - ${th.name} <i>(${th.time})</i>\n`;
-                    index++;
-                }
-                msg += '\n';
-            }
-        }
-        
-        if (cachedAgentThreads.length === 0) {
-            return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
-        }
-        
-        ctx.reply(msg, { parse_mode: 'HTML' });
+        await renderAndSendAgentThreads(ctx, CDP_PORT);
     } catch (e) {
         ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
     }
@@ -4083,40 +4910,43 @@ bot.action(/^ans_(.+)$/, async (ctx) => {
         else if (val) { targetId = val.targetId; explicitThreadName = val.threadName; }
     }
     
-    try {
-        if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
-        setReaction(ctx, REACTION.THINKING, ctx.callbackQuery.message?.message_id);
-        targetId = await sendViaCDP(answer, CDP_PORT, targetId);
-        
-        await new Promise(r => setTimeout(r, 1500));
-        await snapshotChatState(CDP_PORT, targetId).catch(() => {});
+    // Fire-and-forget: don't block Telegraf's update loop
+    (async () => {
+        try {
+            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
+            setReaction(ctx, REACTION.THINKING, ctx.callbackQuery.message?.message_id);
+            targetId = await sendViaCDP(answer, CDP_PORT, targetId);
+            
+            await new Promise(r => setTimeout(r, 1500));
+            await snapshotChatState(CDP_PORT, targetId).catch(() => {});
 
-        const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
-        let text = "";
-        let interactiveButtons = null;
-        if (isDone) {
-            let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
-            text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
-            interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
-            text = stripQueryFromResponse(text, answer);
-        } else {
-            return await ctx.reply(t('ask.timeout'));
-        }
-        
-        if (!text) text = t('ask.done_empty');
-        const header = await getChatHeader(targetId, t('ask.done'));
-        const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
+            const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
+            let text = "";
+            let interactiveButtons = null;
+            if (isDone) {
+                let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
+                text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+                interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+                text = stripQueryFromResponse(text, answer);
+            } else {
+                return await ctx.reply(t('ask.timeout'));
+            }
+            
+            if (!text) text = t('ask.done_empty');
+            const header = await getChatHeader(targetId, t('ask.done'));
+            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
 
-        const sentIds = await sendLongMessage(ctx, text, header, buttons, ctx.callbackQuery.message.message_id);
-        if (sentIds && sentIds.length > 0 && targetId) {
-            const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
-            const currentThreadName = activeInfo ? activeInfo.name : null;
-            sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
-            saveMessageTargetMap(messageTargetMap);
+            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.callbackQuery.message.message_id);
+            if (sentIds && sentIds.length > 0 && targetId) {
+                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                const currentThreadName = activeInfo ? activeInfo.name : null;
+                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
+                saveMessageTargetMap(messageTargetMap);
+            }
+        } catch (e) {
+            ctx.reply(t('error.general_error', { error: e.message })).catch(()=>{});
         }
-    } catch (e) {
-        ctx.reply(t('error.general_error', { error: e.message })).catch(()=>{});
-    }
+    })();
 });
 
 async function handleAgentQuery(ctx, query, explicitTargetId = null, explicitThreadName = null, opts = {}) {
@@ -4196,7 +5026,41 @@ bot.hears(/^!([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/, async (ctx) => {
     const skillName = ctx.match[1];
     const skillArgs = ctx.match[2] ? ctx.match[2].trim() : '';
     const query = `/${skillName} ${skillArgs}`.trim();
-    
+
+let isAgentBusy = false;
+
+// Feedback proceed/cancel handlers
+    bot.action(/^fb_proceed_(.+)$/, async (ctx) => {
+        const convId = ctx.match[1];
+        try {
+            await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
+            await clickArtifactButton('Proceed', CDP_PORT, null);
+            await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.proceeded') || '✅ Proceeded', callback_data: 'noop' }]] });
+        } catch (e) {
+            console.error(e);
+            const errMsg = t('artifact_feedback.error', { message: e.message }) || ('Error: ' + e.message);
+            await ctx.answerCbQuery(errMsg, { show_alert: true });
+        }
+    });
+
+    bot.action(/^fb_cancel_(.+)$/, async (ctx) => {
+        const convId = ctx.match[1];
+        try {
+            await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
+            await clickArtifactButton('Cancel', CDP_PORT, null);
+            await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.canceled') || '❌ Canceled', callback_data: 'noop' }]] });
+        } catch (e) {
+            console.error(e);
+            const errMsg = t('artifact_feedback.error', { message: e.message }) || ('Error: ' + e.message);
+            await ctx.answerCbQuery(errMsg, { show_alert: true });
+        }
+    });
+
+    bot.action('noop', async (ctx) => {
+        await ctx.answerCbQuery();
+    });
+
+        
     let explicitTargetId = null;
     let explicitThreadName = null;
     let explicitClaudeSessionId = null;
@@ -4303,7 +5167,7 @@ async function processAgentRequest(ctx, query, explicitTargetId, explicitThreadN
     const targetId = await sendViaCDP(query, CDP_PORT, explicitTargetId);
     
     if (targetId === "INVALID_MODAL_OPTION") {
-        ctx.reply("❌ Şu anda aktif bir soru paneli (modal) açık. Lütfen seçeneklerden birini girin veya iptal etmek için /stop komutunu kullanın. (Görsel veya serbest metin bu soru için geçerli değil)");
+        ctx.reply(t('error.modal_active'));
         return;
     }
 
@@ -4313,7 +5177,8 @@ async function processAgentRequest(ctx, query, explicitTargetId, explicitThreadN
     
     const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
     if (isDone) {
-        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId);
+        await new Promise(r => setTimeout(r, 2500));
+        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, true);
         let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
         let interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
         
@@ -4326,7 +5191,7 @@ async function processAgentRequest(ctx, query, explicitTargetId, explicitThreadN
         
         const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
         
-        const sentIds = await sendLongMessage(ctx, text, header, buttons, ctx.message.message_id);
+        const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
         if (sentIds && sentIds.length > 0 && targetId) {
             const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
             const currentThreadName = activeInfo ? activeInfo.name : null;
@@ -4664,6 +5529,7 @@ bot.on('audio', async (ctx) => {
 async function init() {
     console.log("Starting initialization...");
     try {
+        await telegraphPublisher.init();
         await clearAllMenuScopes();
         await setMenuOnAllScopes();
         console.log("Menu commands set.");
@@ -4690,13 +5556,20 @@ async function init() {
 
     console.log(t('bot.polling'));
     
+    // Eagerly resolve the active thread so that watchArtifacts starts listening immediately
+    // rather than waiting for the first user message.
+    try {
+        await getActiveThreadId(CDP_PORT).catch(() => {});
+        console.log('[init] Eagerly resolved thread to attach watchers.');
+    } catch (_) {}
+
     bot.catch((err, ctx) => {
         console.error(`[Bot Error] for ${ctx.updateType}:`, err.message || err);
     });
 
     // Check if this boot is after an explicit /restart command.
-    // If so, drop pending updates to prevent the /restart from being re-processed (infinite loop).
-    let shouldDropPending = false;
+    // Drop pending updates on startup to prevent backlog replay spam (Issue #31)
+    let shouldDropPending = true;
     try {
         if (fs.existsSync(RESTART_FLAG_FILE)) {
             shouldDropPending = true;
@@ -4735,7 +5608,7 @@ async function init() {
     const appDataName = preferredApp === 'agent' ? 'antigravity' : 'antigravity-ide';
     
     // Track last proactive notification message per chat for edit-in-place
-    const proactiveMessageIds = new Map(); // chatId -> { messageId, timestamp }
+    const proactiveMessageIds = new Map(); // chatId -> { messageId, timestamp, hasFeedback }
     const PROACTIVE_RESET_MS = 5 * 60 * 1000; // Reset after 5 min of silence
 
     const taskWatcher = new TaskWatcher({
@@ -4748,6 +5621,7 @@ async function init() {
             const maxLen = 4096 - header.length - 10;
             const body = text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
             const fullMsg = header + body;
+            const isFeedback = type === 'agent_proactive_feedback';
 
             for (const chatId of ALLOWED_CHAT_IDS) {
                 try {
@@ -4755,31 +5629,66 @@ async function init() {
                     const now = Date.now();
 
                     // If we have a recent message, try to edit it
+                    // BUT: never overwrite a feedback message (with Proceed/Cancel) with a plain notification
                     if (existing && (now - existing.timestamp) < PROACTIVE_RESET_MS) {
-                        try {
-                            await bot.telegram.editMessageText(
-                                chatId, existing.messageId, null,
-                                fullMsg, { parse_mode: 'HTML' }
-                            );
-                            existing.timestamp = now;
-                            console.log(`[TaskWatcher] Edited existing notification msg ${existing.messageId}`);
-                            continue;
-                        } catch (editErr) {
-                            // Edit failed (message too old, deleted, or content unchanged)
-                            console.log(`[TaskWatcher] Edit failed, sending new: ${editErr.message}`);
+                        // If existing has feedback buttons and new is plain, skip edit — send new
+                        if (existing.hasFeedback && !isFeedback) {
+                            console.log(`[TaskWatcher] Existing msg ${existing.messageId} has Proceed/Cancel buttons — sending new msg instead of overwriting`);
+                            // Fall through to send new message
+                        } else {
+                            try {
+                                const opts = { parse_mode: 'HTML' };
+                                if (isFeedback) {
+                                    opts.reply_markup = {
+                                        inline_keyboard: [
+                                            [
+                                                { text: t('artifact_feedback.proceed') || '✅ Proceed', callback_data: `fb_proceed_${conversationId.substring(0,8)}` },
+                                                { text: t('artifact_feedback.cancel') || '❌ Cancel', callback_data: `fb_cancel_${conversationId.substring(0,8)}` }
+                                            ]
+                                        ]
+                                    };
+                                }
+                                await bot.telegram.editMessageText(
+                                    chatId, existing.messageId, null,
+                                    fullMsg, opts
+                                );
+                                existing.timestamp = now;
+                                existing.hasFeedback = isFeedback;
+                                console.log(`[TaskWatcher] Edited existing notification msg ${existing.messageId}`);
+                                continue;
+                            } catch (editErr) {
+                                // Edit failed (message too old, deleted, or content unchanged)
+                                console.log(`[TaskWatcher] Edit failed, sending new: ${editErr.message}`);
+                            }
                         }
+                    }
+
+                    let replyMarkup = undefined;
+                    if (type === 'agent_proactive_feedback') {
+                        replyMarkup = {
+                            inline_keyboard: [
+                                [
+                                    { text: t('artifact_feedback.proceed') || '✅ Proceed', callback_data: `fb_proceed_${conversationId.substring(0,8)}` },
+                                    { text: t('artifact_feedback.cancel') || '❌ Cancel', callback_data: `fb_cancel_${conversationId.substring(0,8)}` }
+                                ]
+                            ]
+                        };
                     }
 
                     // Send a new message
                     try {
-                        const sent = await bot.telegram.sendMessage(chatId, fullMsg, { parse_mode: 'HTML' });
-                        proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now });
+                        const opts = { parse_mode: 'HTML' };
+                        if (replyMarkup) opts.reply_markup = replyMarkup;
+                        const sent = await bot.telegram.sendMessage(chatId, fullMsg, opts);
+                        proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now, hasFeedback: isFeedback });
                         console.log(`[TaskWatcher] Sent new notification msg ${sent.message_id}`);
                     } catch (err) {
                         if (err.message.includes("parse entities")) {
                             const plain = fullMsg.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-                            const sent = await bot.telegram.sendMessage(chatId, plain);
-                            proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now });
+                            const opts = {};
+                            if (replyMarkup) opts.reply_markup = replyMarkup;
+                            const sent = await bot.telegram.sendMessage(chatId, plain, opts);
+                            proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now, hasFeedback: isFeedback });
                             console.log(`[TaskWatcher] Sent plain text fallback ${sent.message_id}`);
                         } else {
                             throw err;
@@ -4792,14 +5701,1158 @@ async function init() {
         }
     });
 
-    // Wire thread resolution events to TaskWatcher
+    // Wire thread resolution events to TaskWatcher and Artifact Watcher
     setOnThreadResolved((threadId) => {
         taskWatcher.setActiveConversation(threadId);
+        watchArtifacts(threadId);
     });
 
     // Expose taskWatcher globally so text handler can set busy/idle
     global.__taskWatcher = taskWatcher;
+
+    // Start watching the current active/last resolved thread immediately upon bot startup
+    const initialThreadId = getLastResolvedThreadId();
+    if (initialThreadId) {
+        watchArtifacts(initialThreadId);
+    }
 }
+
+/**
+ * Format quota data into a rich Telegram HTML card.
+ *
+ * Handles two model types returned by the quota API:
+ * - Metered models: have `quotaInfo` with `remainingFraction` → shown as a progress bar.
+ * - Unlimited models: no `quotaInfo` (pro/unlimited tier) → shown as ∞ Unlimited.
+ *
+ * @param {object} account - Saved account record.
+ * @param {object} quotaData - Parsed quota response from fetchQuota().
+ * @returns {string} Telegram HTML.
+ */
+function formatQuotaHtml(account, quotaData) {
+    const L = [];
+
+    // ── Header ──
+    L.push(t('quota.info_title'));
+    L.push('━'.repeat(22));
+    L.push(t('quota.user', { name: account.name || account.email }));
+    L.push(t('quota.email', { email: account.email }));
+    L.push(t('quota.id', { id: account.numericId }));
+
+    const tier = (quotaData.subscription_tier || quotaData._tier || '').replace(/_/g, ' ').trim();
+    if (tier) {
+        L.push(t('quota.tier', { tier }));
+    }
+    if (quotaData.ai_credits) {
+        L.push(t('quota.credits', { credits: quotaData.ai_credits.credits.toLocaleString() }));
+    }
+
+    // ── Detailed Quota Groups ──
+    const groups = quotaData.quota_groups || [];
+    const models = quotaData.models || {};
+    const quotaFilterRaw = (process.env.QUOTA_DISPLAY_MODELS || '').trim();
+    const quotaFilter = quotaFilterRaw
+        ? quotaFilterRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : [];
+
+    const matchesFilter = (modelId, info) => {
+        if (quotaFilter.length === 0) {
+            return true;
+        }
+        const displayName = (info.displayName || modelId).toLowerCase();
+        return quotaFilter.some(term => displayName.includes(term));
+    };
+
+    const trackedModels = Object.entries(models)
+        .filter(([name, info]) => /^(gemini|claude|gpt|image|imagen)/i.test(name) && matchesFilter(name, info))
+        .sort(([a], [b]) => {
+            // Recommended first, then alphabetical
+            const aRec = models[a].recommended ? 0 : 1;
+            const bRec = models[b].recommended ? 0 : 1;
+            if (aRec !== bRec) {
+                return aRec - bRec;
+            }
+            return a.localeCompare(b);
+        });
+
+    if (groups.length > 0) {
+        // Helper to format ISO resetTime string to a relative string (e.g., '2d 9h' or '3h 8m')
+        const formatRelativeTime = (isoString) => {
+            if (!isoString) return '';
+            const diffMs = new Date(isoString) - Date.now();
+            if (diffMs <= 0) return 'now';
+
+            const diffSecs = Math.floor(diffMs / 1000);
+            const diffMins = Math.floor(diffSecs / 60);
+            const diffHours = Math.floor(diffMins / 60);
+            const diffDays = Math.floor(diffHours / 24);
+
+            if (diffDays > 0) {
+                const remainingHours = diffHours % 24;
+                return `${diffDays}d ${remainingHours}h`;
+            }
+            if (diffHours > 0) {
+                const remainingMins = diffMins % 60;
+                return `${diffHours}h ${remainingMins}m`;
+            }
+            return `${diffMins}m`;
+        };
+
+        L.push('');
+        L.push(t('quota.detailed_quota_title'));
+        L.push('━'.repeat(22));
+
+        for (const group of groups) {
+            L.push(`<b>${group.display_name}</b>`);
+            if (group.description) {
+                L.push(`<i>${group.description}</i>`);
+            }
+
+            for (const bucket of group.buckets) {
+                const pct = Math.round(bucket.remaining_fraction * 100);
+                const resetStr = formatRelativeTime(bucket.reset_time);
+
+                L.push(`  • <b>${bucket.display_name || bucket.bucket_id}</b>`);
+
+                // 8-segment bar: █ = filled, ░ = empty
+                const filled = Math.round(bucket.remaining_fraction * 8);
+                const bar = '█'.repeat(filled) + '░'.repeat(8 - filled);
+
+                L.push(`    <code>${bar}</code>  <b>${pct}%</b>`);
+                if (resetStr) {
+                    L.push(t('quota.reset_relative', { time: resetStr }));
+                }
+            }
+        }
+    } else if (trackedModels.length > 0) {
+        L.push('');
+        L.push(t('quota.model_quota_title'));
+        L.push('━'.repeat(22));
+
+        for (const [modelId, info] of trackedModels) {
+            const displayName = info.displayName || modelId;
+            const star = info.recommended ? ' ⭐' : '';
+            const isUnlimited = info.unlimited === true || info.quotaInfo === null;
+
+            if (isUnlimited) {
+                // Pro / unlimited tier — no quota cap, show infinity
+                L.push(t('quota.unlimited'));
+                L.push(t('quota.unlimited_model', { model: displayName, star }));
+            } else {
+                // Metered model — show progress bar
+                const remaining = info.quotaInfo?.remainingFraction != null
+                    ? info.quotaInfo.remainingFraction
+                    : (info.percentage != null ? info.percentage / 100 : 0);
+                const pct = Math.round(remaining * 100);
+
+                // 8-segment bar: █ = filled, ░ = empty
+                const filled = Math.round(remaining * 8);
+                const bar = '█'.repeat(filled) + '░'.repeat(8 - filled);
+
+                // Color-coded percentage label
+                const pctLabel = pct >= 50
+                    ? `<b>${pct}%</b>`
+                    : (pct >= 20 ? `${pct}%` : `<i>${pct}%</i>`);
+
+                L.push(`<code>${bar}</code>  ${pctLabel}`);
+                L.push(`  ↳ ${displayName}${star}`);
+
+                const resetTime = info.quotaInfo?.resetTime;
+                if (resetTime) {
+                    const reset = new Date(resetTime);
+                    const resetStr = reset.toLocaleString('en-US', {
+                        month: 'short', day: 'numeric',
+                        hour: '2-digit', minute: '2-digit',
+                        timeZone: 'UTC', timeZoneName: 'short',
+                    });
+                    L.push(t('quota.reset_timestamp', { resetStr }));
+                }
+            }
+        }
+    } else if (quotaData._unlimited) {
+        // Consumer/non-enterprise account — no per-model quota limits
+        L.push('');
+        L.push(t('quota.model_access_title'));
+        L.push('━'.repeat(22));
+        L.push(t('quota.unlimited'));
+        L.push(t('quota.unlimited_desc'));
+    } else {
+        L.push('');
+        L.push(t('quota.no_data'));
+    }
+
+    // ── Token status ──
+    // Access tokens expire every ~60 min, but a refresh_token makes the account
+    // effectively unlimited — ensureFreshToken() auto-refreshes before every operation.
+    const hasRefreshToken = !!(account.token?.refresh_token);
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = account.token?.expiry_timestamp || 0;
+
+    let tokenStatus;
+    if (hasRefreshToken) {
+        // Account is permanently active — access token auto-refreshes
+        tokenStatus = t('quota.token_status_active');
+    } else if (expiresAt === 0) {
+        tokenStatus = t('quota.token_status_unknown');
+    } else {
+        // No refresh token; access token only — show countdown
+        const minsLeft = Math.max(0, Math.round((expiresAt - now) / 60));
+        tokenStatus = minsLeft > 30
+            ? t('quota.token_status_valid', { mins: minsLeft })
+            : (minsLeft > 5
+                ? t('quota.token_status_expiring', { mins: minsLeft })
+                : t('quota.token_status_expired'));
+    }
+
+    L.push('');
+    L.push('━'.repeat(22));
+    L.push(`🔑 ${tokenStatus}`);
+
+    return L.join('\n');
+}
+
+/**
+ * Complete a pending login flow with an authorization code.
+ * Called either by the OAuth server (auto, same-machine) or by manual paste (mobile).
+ */
+async function completePendingLogin(chatId, code) {
+    const session = pendingLogins.get(chatId);
+    if (!session) {
+        return false;
+    }
+    try {
+        await session.oauthServer.stop();
+    } catch { /* ignore */ }
+
+    // Make sure we decode special symbols (like %2F -> /) properly
+    let decodedCode = code;
+    try {
+        decodedCode = decodeURIComponent(code);
+    } catch (_) {}
+
+    // Directly trigger processing of the code asynchronously without blocking the event loop
+    processAuthCode(chatId, decodedCode, session.redirectUri).catch(err => {
+        console.error('[bot] processAuthCode async error:', err);
+    });
+    return true;
+}
+
+/**
+ * Exchange auth code, retrieve user info, save account, fetch quota, and inject credentials.
+ */
+async function processAuthCode(chatId, authCode, redirectUri) {
+    const processingMsg = await bot.telegram.sendMessage(chatId, t('login.authenticating'), { parse_mode: 'HTML' });
+
+    try {
+        // Exchange code for tokens
+        accountManager.logInfo(`[bot] Exchanging code with redirect_uri: ${redirectUri}`);
+        const tokenResp = await accountManager.exchangeCode(authCode, redirectUri);
+        accountManager.logInfo(`[bot] Code exchanged successfully. Access token retrieved.`);
+
+        // Get user info
+        accountManager.logInfo(`[bot] Fetching user info...`);
+        const userInfo = await accountManager.getUserInfo(tokenResp.access_token);
+        if (!userInfo || !userInfo.email) {
+            throw new Error('Failed to retrieve user email from Google. Check your account settings.');
+        }
+        accountManager.logInfo(`[bot] User info retrieved: email=${userInfo.email}`);
+
+        // Save account
+        const accounts = accountManager.loadAccounts();
+        const existing = Object.values(accounts).find(
+            a => a && typeof a === 'object' && a.email && userInfo?.email && a.email.toLowerCase() === userInfo.email.toLowerCase()
+        );
+
+        const now = Math.floor(Date.now() / 1000);
+        const numericId = existing ? existing.numericId : accountManager.getNextNumericId(accounts);
+
+        const account = {
+            numericId,
+            email: userInfo.email,
+            name: userInfo.name || userInfo.email,
+            addedAt: existing ? existing.addedAt : now,
+            updatedAt: now,
+            token: {
+                access_token: tokenResp.access_token,
+                refresh_token: tokenResp.refresh_token || (existing ? existing.token.refresh_token : ''),
+                expires_in: tokenResp.expires_in || 3600,
+                expiry_timestamp: now + (tokenResp.expires_in || 3600),
+                token_type: tokenResp.token_type || 'Bearer',
+            },
+            quota: null,
+        };
+
+        accounts[String(numericId)] = account;
+        accountManager.saveAccounts(accounts);
+        accountManager.logInfo(`[bot] Saved account #${numericId} for ${userInfo.email}`);
+
+        // Try to fetch initial quota (non-fatal if it fails)
+        try {
+            accountManager.logInfo(`[bot] Fetching initial quota for account #${numericId}...`);
+            const quotaData = await accountManager.fetchQuota(tokenResp.access_token);
+            accounts[String(numericId)].quota = quotaData;
+            accountManager.saveAccounts(accounts);
+            accountManager.logInfo(`[bot] Initial quota fetched and saved.`);
+        } catch (e) {
+            accountManager.logInfo(`[bot] Best-effort initial quota fetch failed: ${e.message}`);
+        }
+
+        pendingLogins.delete(chatId);
+
+        const action = existing ? 'updated' : 'added';
+        accountManager.logInfo(`[bot] Sign-in complete for #${numericId}. Editing Telegram message.`);
+        await bot.telegram.editMessageText(chatId, processingMsg.message_id, undefined,
+            [
+                t('login.success_title'),
+                '━'.repeat(22),
+                t('login.success_body', { name: userInfo.name || userInfo.email, email: userInfo.email, numericId, action }),
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+
+    } catch (e) {
+        pendingLogins.delete(chatId); 
+        console.error('[processAuthCode] Unexpected error:', e.message, e.stack);
+        await bot.telegram.editMessageText(chatId, processingMsg.message_id, undefined,
+            [
+                '❌ <b>' + (t('login.failed').split('\n')[0] || 'Authentication failed') + '</b>',
+                '',
+                `<code>${e.message}</code>`,
+            ].join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+    }
+}
+
+// ── /login ────────────────────────────────────────────────────────────────────
+
+bot.command('login', async (ctx) => {
+    const chatId = ctx.chat.id;
+    accountManager.logInfo(`[bot] /login command received from chatId: ${chatId}. Sending warning.`);
+
+    const warningMsg = [
+        t('login.notice_title'),
+        '━'.repeat(22),
+        t('login.notice_body'),
+        '',
+        t('login.prompt_title'),
+    ].join('\n');
+
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(t('login.btn_continue'), `login_confirm_${chatId}`),
+            Markup.button.callback(t('login.btn_cancel_login'), `login_cancel_${chatId}`)
+        ]
+    ]);
+
+    await ctx.reply(warningMsg, { parse_mode: 'HTML', ...keyboard });
+});
+
+bot.action(/^login_confirm_(\d+)$/, async (ctx) => {
+    const chatId = parseInt(ctx.match[1]);
+    accountManager.logInfo(`[bot] Login confirmed for chatId: ${chatId}. Initiating OAuth callback server...`);
+    
+    await ctx.answerCbQuery(t('login.starting').replace(/<[^>]+>/g, '').trim()).catch(() => {});
+
+    // Cancel any existing pending login for this chat
+    if (pendingLogins.has(chatId)) {
+        accountManager.logInfo(`[bot] Cancelling existing pending login session for chatId: ${chatId}`);
+        const old = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await old.oauthServer.stop(); } catch { /* ignore */ }
+    }
+
+    let statusMsg;
+    try {
+        statusMsg = await ctx.editMessageText(t('login.starting'), { parse_mode: 'HTML' });
+    } catch {
+        statusMsg = await ctx.reply(t('login.starting'), { parse_mode: 'HTML' });
+    }
+
+    try {
+        // 1. Start OAuth callback server
+        accountManager.logInfo(`[bot] Starting OAuth server...`);
+        let oauthServer;
+        try {
+            oauthServer = await accountManager.startOAuthServer(
+                async (code) => {
+                    accountManager.logInfo(`[bot] OAuth server captured code for chatId: ${chatId}`);
+                    await completePendingLogin(chatId, code);
+                },
+                async (errMsg) => {
+                    accountManager.logInfo(`[bot] OAuth server error callback for chatId: ${chatId}: ${errMsg}`);
+                    const session = pendingLogins.get(chatId);
+                    if (session) {
+                        pendingLogins.delete(chatId);
+                        await bot.telegram.sendMessage(chatId, t('login.server_error', { error: errMsg }), { parse_mode: 'HTML' }).catch(() => {});
+                    }
+                }
+            );
+        } catch (e) {
+            accountManager.logInfo(`[bot] Failed to start OAuth server: ${e.message}`);
+            await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined,
+                [
+                    '❌ <b>Login server error</b>',
+                    '',
+                    `<code>${e.message}</code>`,
+                ].join('\n'), { parse_mode: 'HTML' });
+            return;
+        }
+
+        const redirectUri = `http://localhost:${oauthServer.port}/oauth-callback`;
+        const authUrl = accountManager.buildAuthUrl(redirectUri, oauthServer.state);
+        accountManager.logInfo(`[bot] Auth URL built: redirect_uri=${redirectUri}`);
+
+        // Register the pending session (with a 10-minute timeout)
+        pendingLogins.set(chatId, { oauthServer, redirectUri, tryCount: 0 });
+        
+        setTimeout(async () => {
+            if (pendingLogins.has(chatId)) {
+                pendingLogins.delete(chatId);
+                try { await oauthServer.stop(); } catch { /* ignore */ }
+                await bot.telegram.sendMessage(chatId, t('login.timeout'), { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }, 10 * 60 * 1000);
+
+        // Send the login link
+        const loginMsg = [
+            '🔐 <b>Sign in with Google</b>',
+            '━'.repeat(22),
+            'Tap the button below to sign in with your',
+            'Google account and connect it to this bot.',
+            '',
+            '📱 <b>On mobile?</b>',
+            'If your browser shows a connection error after',
+            'signing in, just copy the <b>full URL</b> from',
+            'the address bar and paste it here.',
+            '',
+            '⏱  Expires in <b>10 minutes</b>',
+        ].join('\n');
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.url('🔒 Sign in with Google', authUrl)],
+            [Markup.button.callback('❌ Cancel Login', `login_cancel_${chatId}`)],
+        ]);
+
+        try {
+            await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined,
+                loginMsg, { parse_mode: 'HTML', ...keyboard });
+        } catch {
+            await ctx.reply(loginMsg, { parse_mode: 'HTML', ...keyboard });
+        }
+
+    } catch (e) {
+        console.error('[/login] Unexpected error:', e.message, e.stack);
+        ctx.reply([
+            '❌ <b>Something went wrong</b>',
+            '',
+            `<code>${e.message}</code>`,
+        ].join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+    }
+});
+
+// Cancel login inline button
+bot.action(/^login_cancel_(\d+)$/, async (ctx) => {
+    const chatId = parseInt(ctx.match[1]);
+    if (pendingLogins.has(chatId)) {
+        const session = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await session.oauthServer.stop(); } catch { /* ignore */ }
+    }
+    await ctx.answerCbQuery(t('login.cancelled').split('\n')[0].replace(/<[^>]+>/g, '').trim());
+    await ctx.editMessageText(t('login.cancelled'), { parse_mode: 'HTML' }).catch(() => {});
+});
+
+// ── /logincode ────────────────────────────────────────────────────────────────
+// Explicit code submission for mobile users who cannot reach localhost.
+
+bot.command('logincode', async (ctx) => {
+    const chatId = ctx.chat.id;
+    const rawInput = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+    if (!rawInput) {
+        return ctx.reply(t('login.code_usage'), { parse_mode: 'HTML' });
+    }
+
+    // Extract code from full URL or bare code
+    let code = rawInput;
+    const match = rawInput.match(/[?&]code=([^&\s]+)/);
+    if (match) {
+        code = match[1];
+    }
+
+    if (!pendingLogins.has(chatId)) {
+        return ctx.reply(t('login.no_active_session'), { parse_mode: 'HTML' });
+    }
+
+    const completed = await completePendingLogin(chatId, code);
+    if (!completed) {
+        return ctx.reply(t('login.no_active_session_short'), { parse_mode: 'HTML' });
+    }
+    await ctx.reply(t('login.code_received'), { parse_mode: 'HTML' });
+});
+
+// ── /accounts ─────────────────────────────────────────────────────────────────
+
+bot.command('accounts', async (ctx) => {
+    await renderAccountsPanel(ctx);
+});
+
+/**
+ * Render the interactive accounts panel with inline buttons.
+ * Used by /accounts command and acc_refresh callback.
+ */
+async function renderAccountsPanel(ctx, editMessageId = null) {
+    const accounts = accountManager.loadAccounts();
+    const entries = Object.entries(accounts)
+        .filter(([k, v]) => !k.startsWith('__') && v && typeof v === 'object' && v.numericId)
+        .map(([, v]) => v)
+        .sort((a, b) => a.numericId - b.numericId);
+
+    if (entries.length === 0) {
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('➕ ' + (t('accounts.btn_add') || 'Add Account'), 'acc_login')],
+        ]);
+        const msg = t('login.no_accounts') || '📭 <b>No accounts saved yet</b>\n\nUse /login to add a Google account.';
+        if (editMessageId) {
+            return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, msg, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+        }
+        return ctx.reply(msg, { parse_mode: 'HTML', ...keyboard });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+
+    // Determine which account is currently active
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+    let activeId = accounts.__activeId || null;
+    if (!activeId) {
+        try {
+            const ideEmail = await accountManager.getActiveEmail(app);
+            if (ideEmail) {
+                const match = entries.find(e => e.email.toLowerCase() === ideEmail.toLowerCase());
+                if (match) activeId = String(match.numericId);
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Compact header — just title
+    const L = [
+        `🔐 <b>${t('accounts.title') || 'Saved Accounts'}</b>`,
+    ];
+
+    // Build inline buttons: one row per account
+    // Active: 🟢 email (no switch needed)  |  📊  |  🗑
+    // Others: 🔄 email (click to switch)   |  📊  |  🗑
+    const buttons = [];
+    for (const acc of entries) {
+        const isActive = activeId && String(acc.numericId) === String(activeId);
+        const isAccessExpired = (acc.token?.expiry_timestamp || 0) < now;
+        const hasRefreshToken = !!acc.token?.refresh_token;
+
+        // Short email label (truncate if > 25 chars for button fit)
+        const emailLabel = acc.email.length > 25
+            ? acc.email.slice(0, 22) + '…'
+            : acc.email;
+
+
+        let switchLabel;
+        if (isActive) {
+            switchLabel = `🟢 ${acc.email}`;
+        } else if (isAccessExpired && !hasRefreshToken) {
+            switchLabel = `🔴 ${acc.email}`;
+        } else {
+            switchLabel = `🔄 ${acc.email}`;
+        }
+
+        // Row 1: full-width email button
+        buttons.push([
+            Markup.button.callback(switchLabel, isActive ? `acc_info_${acc.numericId}` : `acc_switch_${acc.numericId}`),
+        ]);
+        // Row 2: action icons
+        buttons.push([
+            Markup.button.callback(`📊 ${t('accounts.btn_quota') || 'Quota'}`, `acc_info_${acc.numericId}`),
+            Markup.button.callback(`🗑 ${t('accounts.btn_delete') || 'Delete'}`, `acc_del_${acc.numericId}`),
+        ]);
+    }
+    buttons.push([
+        Markup.button.callback('➕ ' + (t('accounts.btn_add') || 'Add Account'), 'acc_login'),
+    ]);
+
+    const keyboard = Markup.inlineKeyboard(buttons);
+    const text = L.join('\n');
+
+    if (editMessageId) {
+        return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+    }
+    await ctx.reply(text, { parse_mode: 'HTML', ...keyboard });
+}
+
+// ── Account Panel Callback Handlers ──────────────────────────────────────────
+
+// Switch account via button
+bot.action(/^acc_switch_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery(`Switching to #${id}...`);
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('switchacc.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+    
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+    const steps = [];
+    const editStatus = async (text) => {
+        try { await ctx.editMessageText(text, { parse_mode: 'HTML' }); } catch { /* ignore */ }
+    };
+
+    try {
+        steps.push(t('switchacc.step_refreshing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) { accounts[id] = freshAccount; accountManager.saveAccounts(accounts); steps[steps.length - 1] = t('switchacc.step_refreshed'); }
+        else { steps[steps.length - 1] = t('switchacc.step_valid'); }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        // Sync global config files for Antigravity
+        accountManager.syncAntigravityGlobalFiles(freshAccount);
+
+        const targetApps = ['agent', 'ide'];
+        const runningStates = {};
+
+        steps.push(t('switchacc.step_stopping', { app: 'all' }) || 'Stopping Antigravity instances...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            const wasRunning = await isIDERunning(targetApp);
+            runningStates[targetApp] = wasRunning;
+            if (wasRunning) {
+                await killIDE(targetApp);
+                await waitForProcessDead(targetApp, 4000);
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_stopped', { app: 'all' }) || 'Stopped Antigravity instances';
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_writing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        let writeErrors = [];
+        for (const targetApp of targetApps) {
+            try {
+                await accountManager.injectTokenIntoIde(freshAccount, targetApp);
+            } catch (injErr) {
+                writeErrors.push(`${targetApp}:${injErr.message.slice(0,30)}`);
+            }
+        }
+        
+        try {
+            await accountManager.writeToCredentialStore(freshAccount.token);
+        } catch (credErr) {
+            writeErrors.push(`keyring:${credErr.message.slice(0,30)}`);
+        }
+        
+        if (writeErrors.length > 0) {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' }) + ` (Errors: ${writeErrors.join(', ')})`;
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' });
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_starting', { app: 'apps' }) || 'Restarting apps...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            if (runningStates[targetApp]) {
+                const appPort = getCDPPort(targetApp);
+                const lastWs = getLastWorkspace(targetApp);
+                try {
+                    cleanLockFile(targetApp);
+                    await launchIDE(lastWs, appPort, targetApp);
+                } catch (e) {
+                    console.error(`[acc_switch] Failed to restart ${targetApp}: ${e.message}`);
+                }
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_started', { app: 'apps' }) || 'Restarted apps';
+
+        // Mark this account as active for the panel display
+        accounts.__activeId = String(account.numericId);
+        accountManager.saveAccounts(accounts);
+
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.step_done', { id: account.numericId }));
+        steps.push(t('switchacc.step_done_email', { email: account.email }));
+        await editStatus(buildSwitchStatus(account, steps));
+    } catch (e) {
+        console.error('[acc_switch] Error:', e.message);
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.error', { error: escHtml(e.message) }));
+        await editStatus(buildSwitchStatus(account, steps));
+    }
+});
+
+// View quota via button
+bot.action(/^acc_info_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery(`Loading quota for #${id}...`);
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('quota.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    await ctx.editMessageText(t('quota.fetching', { id: account.numericId }), { parse_mode: 'HTML' }).catch(() => {});
+
+    try {
+        const { account: fresh, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) { accounts[id] = fresh; accountManager.saveAccounts(accounts); }
+
+        const quota = await accountManager.fetchQuota(fresh.token.access_token);
+        accounts[id].quota = quota;
+        accountManager.saveAccounts(accounts);
+
+        const text = formatQuotaHtml(account, quota);
+
+        const backBtn = Markup.inlineKeyboard([
+            [Markup.button.callback('◀️ ' + (t('accounts.btn_back') || 'Back to Accounts'), 'acc_refresh')],
+        ]);
+
+        await ctx.editMessageText(text, { parse_mode: 'HTML', ...backBtn }).catch(() => {});
+    } catch (e) {
+        await ctx.editMessageText(`❌ <code>${escHtml(e.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    }
+});
+
+// Delete via button — triggers confirmation
+bot.action(/^acc_del_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery();
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('quota.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    const confirmKeyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(`🗑 ${t('accounts.btn_confirm_delete') || 'Yes, delete'} #${account.numericId}`, `delacc_confirm_${account.numericId}`),
+            Markup.button.callback('✖ ' + (t('accounts.btn_cancel') || 'Cancel'), `delacc_cancel_${account.numericId}`),
+        ],
+    ]);
+
+    await ctx.editMessageText(
+        [
+            `⚠️ <b>${t('accounts.delete_confirm_title') || 'Delete Account'} #${account.numericId}?</b>`,
+            '━'.repeat(22),
+            `👤 <b>${account.name || account.email}</b>`,
+            `📧 <code>${account.email}</code>`,
+            '',
+            t('accounts.delete_confirm_body') || 'This removes the saved token from this bot.',
+            '<i>' + (t('accounts.delete_confirm_note') || 'Antigravity itself will not be affected.') + '</i>',
+        ].join('\n'),
+        { parse_mode: 'HTML', ...confirmKeyboard }
+    ).catch(() => {});
+});
+
+// Refresh / back to accounts panel
+bot.action('acc_refresh', async (ctx) => {
+    await ctx.answerCbQuery();
+    await renderAccountsPanel(ctx, ctx.callbackQuery.message.message_id);
+});
+
+// Login new account via panel button
+bot.action('acc_login', async (ctx) => {
+    const chatId = ctx.chat.id;
+    await ctx.answerCbQuery();
+    accountManager.logInfo(`[bot] acc_login button pressed from chatId: ${chatId}. Sending login notice.`);
+
+    const warningMsg = [
+        t('login.notice_title'),
+        '━'.repeat(22),
+        t('login.notice_body'),
+        '',
+        t('login.prompt_title') || 'Do you want to proceed?',
+    ].join('\n');
+
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(t('login.btn_continue') || '👉 Yes, Continue', `login_confirm_${chatId}`),
+            Markup.button.callback(t('login.btn_cancel') || '✖ Cancel', `login_cancel_${chatId}`)
+        ]
+    ]);
+
+    await ctx.reply(warningMsg, { parse_mode: 'HTML', ...keyboard });
+});
+
+// ── /switchacc ────────────────────────────────────────────────────────────────
+
+/**
+ * Build the message text for the /switchacc live progress card.
+ * Keeps the header constant so Telegram can edit it smoothly.
+ */
+function buildSwitchStatus(account, steps) {
+    return [
+        t('switchacc.title', { id: account.numericId }),
+        t('switchacc.email', { email: account.email }),
+        '━'.repeat(22),
+        ...steps,
+    ].join('\n');
+}
+
+/**
+ * Wait for the specified Antigravity app to fully exit.
+ * Polls isIDERunning() at 500ms intervals for up to timeoutMs (default 8s).
+ * Mirrors AntigravityManager's _waitForProcessExit() in handler.ts.
+ *
+ * @param {string} app - 'agent' or 'ide'
+ * @param {number} [timeoutMs=8000]
+ * @returns {Promise<boolean>} true if the process exited, false if timeout
+ */
+async function waitForProcessDead(app, timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const running = await isIDERunning(app);
+        if (!running) {
+            return true;
+        }
+        await new Promise(r => setTimeout(r, 500));
+    }
+    // Timeout — process may still be alive, but we proceed anyway
+    return false;
+}
+
+bot.command('switchacc', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    if (!idArg || isNaN(Number(idArg))) {
+        return ctx.reply(t('switchacc.usage'), { parse_mode: 'HTML' });
+    }
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, idArg);
+
+    if (!account) {
+        return ctx.reply(t('switchacc.not_found', { id: idArg }), { parse_mode: 'HTML' });
+    }
+
+    // The preferred app to kill and restart; defaults to 'ide' since the user
+    // has ANTIGRAVITY_PREFERRED_APP=ide — but credential injection targets both.
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+
+    const statusMsg = await ctx.reply(
+        [
+            t('switchacc.title', { id: account.numericId }),
+            t('switchacc.email', { email: account.email }),
+            '━'.repeat(22),
+        ].join('\n'),
+        { parse_mode: 'HTML' }
+    );
+
+    const steps = [];
+    const editStatus = async (text) => {
+        try {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id, statusMsg.message_id, undefined,
+                text, { parse_mode: 'HTML' }
+            );
+        } catch { /* ignore edit failures */ }
+    };
+
+    try {
+        // Step 1 — Refresh token if needed
+        // Mirrors AntigravityManager's pre-switch token refresh in switchCloudAccount()
+        steps.push(t('switchacc.step_refreshing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) {
+            // Always persist refreshed tokens by the accounts-map key (idArg),
+            // not just by numericId, to avoid stale token on next use.
+            accounts[String(idArg)] = freshAccount;
+            accountManager.saveAccounts(accounts);
+            steps[steps.length - 1] = t('switchacc.step_refreshed');
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_valid');
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        // Sync global config files for Antigravity
+        accountManager.syncAntigravityGlobalFiles(freshAccount);
+
+        const targetApps = ['agent', 'ide'];
+        const runningStates = {};
+
+        steps.push(t('switchacc.step_stopping', { app: 'all' }) || 'Stopping Antigravity instances...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            const wasRunning = await isIDERunning(targetApp);
+            runningStates[targetApp] = wasRunning;
+            if (wasRunning) {
+                await killIDE(targetApp);
+                await waitForProcessDead(targetApp, 4000);
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_stopped', { app: 'all' }) || 'Stopped Antigravity instances';
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_writing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        let writeErrors = [];
+        for (const targetApp of targetApps) {
+            try {
+                await accountManager.injectTokenIntoIde(freshAccount, targetApp);
+            } catch (injErr) {
+                writeErrors.push(`${targetApp}:${injErr.message.slice(0,30)}`);
+            }
+        }
+        
+        try {
+            await accountManager.writeToCredentialStore(freshAccount.token);
+        } catch (credErr) {
+            writeErrors.push(`keyring:${credErr.message.slice(0,30)}`);
+        }
+        
+        if (writeErrors.length > 0) {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' }) + ` (Errors: ${writeErrors.join(', ')})`;
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' });
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_starting', { app: 'apps' }) || 'Restarting apps...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            if (runningStates[targetApp]) {
+                const appPort = getCDPPort(targetApp);
+                const lastWs = getLastWorkspace(targetApp);
+                try {
+                    cleanLockFile(targetApp);
+                    await launchIDE(lastWs, appPort, targetApp);
+                } catch (e) {
+                    console.error(`[switchacc] Failed to restart ${targetApp}: ${e.message}`);
+                }
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_started', { app: 'apps' }) || 'Restarted apps';
+
+        // Step 5 — Done
+        // Mark this account as active for the panel display
+        accounts.__activeId = String(account.numericId);
+        accountManager.saveAccounts(accounts);
+
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.step_done', { id: account.numericId }));
+        steps.push(t('switchacc.step_done_email', { email: account.email }));
+        await editStatus(buildSwitchStatus(account, steps));
+
+    } catch (e) {
+        console.error('[/switchacc] Error:', e.message);
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.error', { error: escHtml(e.message) }));
+        await editStatus(buildSwitchStatus(account, steps));
+    }
+});
+
+// ── /getinfo ──────────────────────────────────────────────────────────────────
+
+bot.command('getinfo', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    const accounts = accountManager.loadAccounts();
+    const allAccounts = Object.values(accounts).filter(a => a && typeof a === 'object').sort((a, b) => a.numericId - b.numericId);
+
+    if (allAccounts.length === 0) {
+        return ctx.reply(t('quota.no_accounts'), { parse_mode: 'HTML' });
+    }
+
+    // Default to account #1 if no ID given
+    let account;
+    if (!idArg) {
+        account = allAccounts[0];
+    } else if (isNaN(Number(idArg))) {
+        return ctx.reply(t('quota.usage'), { parse_mode: 'HTML' });
+    } else {
+        account = accountManager.findAccount(accounts, idArg);
+    }
+
+    if (!account) {
+        return ctx.reply(t('quota.not_found', { id: idArg }), { parse_mode: 'HTML' });
+    }
+
+    setReaction(ctx, REACTION.THINKING);
+    const loadingMsg = await ctx.reply(t('quota.fetching'), { parse_mode: 'HTML' });
+
+    try {
+        // Refresh token if needed
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) {
+            accounts[String(account.numericId)] = freshAccount;
+            accountManager.saveAccounts(accounts);
+            account = freshAccount;
+        }
+
+        // Fetch fresh quota
+        let quotaData = account.quota || {};
+        try {
+            quotaData = await accountManager.fetchQuota(account.token.access_token);
+            accounts[String(account.numericId)].quota = quotaData;
+            accountManager.saveAccounts(accounts);
+        } catch (e) {
+            console.warn('[/getinfo] Quota fetch failed:', e.message);
+        }
+
+        const html = formatQuotaHtml(account, quotaData);
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, undefined,
+            html,
+            { parse_mode: 'HTML' }
+        );
+        setReaction(ctx, REACTION.SUCCESS);
+
+    } catch (e) {
+        console.error('[/getinfo] Error:', e.message);
+        setReaction(ctx, null);
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, undefined,
+            t('quota.fetch_failed', { error: e.message }),
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    }
+});
+
+// ── /delacc ─────────────────────────────────────────────────────────────────
+
+bot.command('delacc', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    if (!idArg || isNaN(Number(idArg))) {
+        return ctx.reply(
+            [
+                'ℹ️ <b>Usage</b>',
+                '━'.repeat(22),
+                '<code>/delacc &lt;id&gt;</code>',
+                '',
+                'Example: <code>/delacc 2</code>',
+                'Use /accounts to see your account IDs.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, idArg);
+
+    if (!account) {
+        return ctx.reply(
+            [
+                `❌ <b>Account #${idArg} not found</b>`,
+                '',
+                'Use /accounts to see your saved accounts.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // Ask for confirmation before deleting
+    const confirmKeyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(`🗑 Yes, delete #${account.numericId}`, `delacc_confirm_${account.numericId}`),
+            Markup.button.callback('✖ Cancel', `delacc_cancel_${account.numericId}`),
+        ],
+    ]);
+
+    await ctx.reply(
+        [
+            `⚠️ <b>Delete Account #${account.numericId}?</b>`,
+            '━'.repeat(22),
+            `👤 <b>${account.name || account.email}</b>`,
+            `📧 <code>${account.email}</code>`,
+            '',
+            'This removes the saved token from this bot.',
+            '<i>Antigravity itself will not be affected.</i>',
+        ].join('\n'),
+        { parse_mode: 'HTML', ...confirmKeyboard }
+    );
+});
+
+// Confirmation: delete
+bot.action(/^delacc_confirm_(\d+)$/, async (ctx) => {
+    const numericId = parseInt(ctx.match[1]);
+    await ctx.answerCbQuery();
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, String(numericId));
+
+    if (!account) {
+        return ctx.editMessageText(
+            [
+                `❌ <b>Account #${numericId} not found</b>`,
+                '',
+                'It may have already been deleted.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    }
+
+    const email = account.email;
+
+    // Check and log out from active IDE/Agent if the email matches
+    let loggedOutApps = [];
+    for (const app of ['ide', 'agent']) {
+        try {
+            const activeEmail = await accountManager.getActiveEmail(app);
+            if (activeEmail && activeEmail.toLowerCase() === email.toLowerCase()) {
+                await accountManager.logoutIde(app);
+                loggedOutApps.push(app.toUpperCase());
+            }
+        } catch (e) {
+            console.error(`[delacc logout] Error checking/logging out of ${app}:`, e.message);
+        }
+    }
+
+    delete accounts[String(numericId)];
+    accountManager.saveAccounts(accounts);
+
+    const remaining = Object.keys(accounts).filter(k => !k.startsWith('__')).length;
+    
+    let logoutNote = '';
+    if (loggedOutApps.length > 0) {
+        logoutNote = `\n🔓 <b>Session Invalidated</b>: Logged out active session in ${loggedOutApps.join(' & ')}.\n`;
+    }
+
+    await ctx.editMessageText(
+        [
+            `🗑 <b>Account #${numericId} deleted</b>`,
+            '━'.repeat(22),
+            `📧 ${email}`,
+            logoutNote,
+            remaining > 0
+                ? `${remaining} account${remaining !== 1 ? 's' : ''} remaining. Use /accounts to view them.`
+                : 'No accounts remain. Use /login to add one.',
+        ].join('\n'),
+        { parse_mode: 'HTML' }
+    ).catch(() => {});
+});
+
+// Confirmation: cancel
+bot.action(/^delacc_cancel_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery('Cancelled');
+    await ctx.editMessageText(
+        [
+            '✖ <b>Deletion cancelled</b>',
+            '',
+            'Account was not deleted.',
+        ].join('\n'),
+    ).catch(() => {});
+});
 
 init();
 
@@ -4822,6 +6875,10 @@ startHeartbeat();
 const handleExit = async (signal) => {
     console.log(`\nReceived ${signal}. Stopping bot polling...`);
     if (global.__taskWatcher) global.__taskWatcher.stop();
+    for (const watcher of artifactWatchers.values()) {
+        try { watcher.close(); } catch (_) {}
+    }
+    artifactWatchers.clear();
     try {
         // Fire-and-forget: bot.stop() may never resolve during long-polling,
         // but calling it triggers the internal cleanup (webhook delete, offset commit).

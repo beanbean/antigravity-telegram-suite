@@ -4,7 +4,84 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [3.5.5] - 2026-06-27
+## [3.8.2] - 2026-08-01
+
+### Fixed
+- **Cleanup**: Removed local test files and debug scripts from the repository.
+- **Bug Fixes**: Applied recent decoupled parsing bug fixes for standalone agent and ide driver implementations.
+## [3.8.0] - 2026-07-31
+
+### Added
+- **Dual-Engine Architecture (IDE & Standalone Agent):** Introduced `DriverFactory` to fully isolate UI locators and logic for Classic Monaco IDE and Standalone Agent. Fixes applied to one app will no longer conflict with the other.
+- **Seamless App Switching (`/app`):** Switching preferred applications via Telegram now safely terminates (`killIDE`) the background process of the previously active app. This prevents orphaned zombie processes from holding CDP ports hostage and guarantees a clean launch of the new application.
+- **Opt-in Project Memory Convention**: New `AUTO_MEMORY_CONVENTION=true` env flag. Ensures the target project contains a lightweight "Project Memory" section (`AGENT.md`), nudging AI agents to record durable decisions/conventions/gotchas/fixes by editing the file directly.
+- **`/memory` Command**: Added a Telegram command to check the status of the Project Memory feature, view existing memory files, and toggle the auto-injection feature on or off.
+
+### Changed
+- **Decoupled Autoaccept**: Standardized the auto-accept injection loop to explicitly scope observers to their respective app environments rather than relying on CDP port comparisons.
+
+### Fixed
+- **Telegraph Publisher State Leaks**: Fixed an issue where switching applications via `/app` without restarting Node.js caused `telegraph_publisher` to leak cached page mappings and credentials between `antigravity-ide` and `antigravity` directories, resulting in broken publishing. State is now securely isolated per driver instance.
+
+## [3.7.1] - 2026-07-29
+
+### Fixed
+- **CDP Chat DOM Extraction (`CHAT_EXTRACT_EXPR`)**: Fixed issue where `Runtime.evaluate` returned `undefined` when evaluating DOM extraction scripts containing top-level `var` statements. Wrapped `CHAT_EXTRACT_EXPR` in a returning IIFE arrow function `(() => { ${UI_LOCATORS_SCRIPT} return (function() { ... })(); })()`. This prevents `getFullLatestResponse` from failing DOM extraction and falling back to stale filesystem transcripts.
+- **Model Selector & Option Exclusion (IDE & Standalone)**: Fixed `getModelSelectorButton()` and `getModelOptions()` capturing open editor tabs and file explorer tree items (e.g. `model_utils.js`, `CLAUDE.md`, `GEMINI.md`) as model selector buttons. Added strict exclusions for Monaco tree view rows, editor tabs (`.tabs-container`), and file extensions (`.js`, `.jsx`, `.ts`, `.md`, `.json`, etc.).
+
+## [3.7.0] - 2026-07-28
+
+### Added
+- **Opt-in Project Memory Convention**: New `AUTO_MEMORY_CONVENTION=true` env flag. When enabled, switching workspace via `/workspace` ensures the target project's `CLAUDE.md`/`AGENT.md`/`GEMINI.md` contains a lightweight "Project Memory" section, nudging agents to record durable decisions/conventions/gotchas/fixes by editing the file directly — no MCP server, vector DB, or mandatory tool-call round trips. Idempotent (skips if already present). Off by default.
+- **`/memory` Command**: Added a Telegram command (`/memory`, `/memory on`, `/memory off`) to dynamically check the status of the Project Memory feature for the active workspace, view which memory files exist, and toggle the auto-injection feature on or off for the current session.
+
+### Fixed
+- **Standalone App Model Switching**: Fixed Radix UI & Base UI popover interaction in Standalone Agent 2.0. Model selection now dispatches full pointer event sequences (`pointerdown` → `mousedown` → `pointerup` → `mouseup` → `click`) and guards against accidentally closing open dropdowns.
+- **Standalone App Workspace Switch (`/workspace`)**: Fixed workspace switching opening new chats in the old active workspace instead of the newly selected target. Now directly targets the project-specific `a[aria-label="New Conversation in Project"]` link within the project card DOM container.
+- **Standalone App Agent Thread Scoping (`/agents`)**: Resolved issue where all conversations were duplicated under every workspace card. Rewrote sidebar DOM traversal to walk flat container siblings sequentially, properly attributing threads to their parent project and hiding empty workspaces.
+- **Unassigned / Standalone Conversation Grouping**: Fixed global/unassigned conversations falsely attaching to the last project card by detecting section headers (e.g. `Conversations`) and grouping non-project threads under their own `Conversations` section.
+- **Standalone App Accordion Toggle Protection**: Prevented `switchStandaloneWorkspace()` from collapsing already-expanded project cards during workspace switching.
+- **Graceful Shutdown & Preserved Chat History**: Replaced aggressive termination in `killIDE()` on Linux and Windows. Instead of sending SIGKILL (`pkill -9` / `/F`) after a rigid 3-second sleep, the process now receives SIGTERM (`pkill -15`) to allow Electron to gracefully save databases, followed by polling.
+- **Multi-Account Sync Between IDE & Standalone App**: Fixed issue where IDE and Standalone App showed different active accounts after switching.
+- **Linux Keyring Write via Python DBus**: Replaced `secret-tool` dependency with a new `keyring_helper.py` using Python's built-in `dbus` module.
+- **Graceful Agent SQLite Skip**: `injectTokenIntoIde()` no longer throws when Standalone App's `state.vscdb` doesn't exist.
+
+### Changed
+- **Dual-App Account Switching**: `/switchacc` now injects credentials into both IDE and Standalone App simultaneously, syncing global configs and OS keyring in a single operation.
+
+## [3.6.1] - 2026-07-27
+
+### Added
+- **Full Standalone App Support**: All major commands now work natively with Antigravity 2.0 Standalone App without requiring the IDE. Tested and confirmed: `/agents`, `/agents_N`, `/latest`, `/model` (list & select), `/new`, `/autoaccept`, message sending.
+
+### Fixed
+- **CSS/Style Leaking into Messages**: `<style>` and `<script>` blocks were leaking into Telegram message content when using the Standalone App. These are now stripped during DOM extraction.
+- **"Ask anything" Placeholder in Messages**: The IDE input placeholder text (`Ask anything, @ to mention, / for actions`) was appearing in extracted message content. Now filtered out.
+- **Auto-accept Numbered Buttons**: Auto-accept was failing to click permission buttons in Standalone App because they have numeric prefixes (e.g. `1 Yes, allow this time`). The matching logic now strips leading numbers before comparison.
+- **Auto-accept Observer Re-injection**: After bot restart, the MutationObserver was silently skipping re-injection due to a stale `already-active` guard. Fixed to properly disconnect the old observer and inject fresh code.
+- **`/agents` Empty List**: The conversation list extractor was relying on a Tailwind class (`ml-[22px]`) that doesn't exist in Standalone App DOM. Rewritten to walk up 3 levels from `[data-project-card]` and read sibling `span.truncate` elements.
+- **`/agents_N` "Could not select conversation"**: Thread switching was using the same broken `ml-[22px]` selector for click targeting. Fixed to use the correct sibling DOM structure with robust `mousedown`/`mouseup`/`click` synthetic events for React compatibility.
+- **`/latest` Returns Stale Conversation After Agent Switch**: After switching threads with `/agents_N`, the bot was resolving conversation ID via fuzzy title matching (unreliable). Now reads the conversation UUID directly from the page URL (`/c/<uuid>`) after navigation completes.
+- **Model List Missing Gemini 3.6**: `AG_UI.isVisible()` was returning false for model dropdown items in Standalone App. Added a fallback that scans all DOM elements for model-like text when the IDE approach yields fewer than 2 results.
+- **Model Selection Broken**: `selectModel` was using `getDropdownOptions()` with a `btn.contains(el)` filter that excluded all options in Standalone. Restored the correct open→wait(600ms)→read→click flow with dual-strategy fallback.
+- **PM2 Process Lost on System Restart**: Bot was not configured to survive macOS reboots. Added `pm2 save` and instructions for `pm2 startup launchd`.
+
+## [3.6.0] - 2026-07-08
+
+### Added
+- **Multi-Account Switching**: Complete overhaul of the `/accounts` command. You can now authenticate and switch between multiple Google accounts. Accounts are persisted securely in `accounts.json` and credentials are automatically injected into the IDE's SQLite database or OS keychain when switching.
+- **Telegraph Publishing**: Task checklists, implementation plans, and walkthroughs (like `/gettask` or `/getplan`) are now automatically published to telegra.ph. Links are shared in Telegram as tap-to-open Instant View articles for better readability.
+- **Community Links**: Added Official Telegram Channel (`@agts_updates`) and Discussion Group (`@agts_community`) links to auto-update notifications and README for users to stay connected.
+
+### Changed
+- **Account Panel Redesign**: The `/accounts` panel now uses a two-row button layout per account, preventing email truncation while keeping action icons accessible.
+- **Active Account Highlight**: The active account is now marked with a 🟢 green indicator, switching to 🔴 if the token is expired, or 🔄 for other registered accounts.
+
+### Fixed
+- **Standalone App New Chat Crash**: Fixed a bug where clicking the 'New Chat' button globally without a workspace context caused the Standalone IDE (`ag`) to crash or freeze.
+- **Workspace State Persistence**: `switchacc` now remembers the last active workspace and restores it properly after restarting the IDE.
+- **SQLite Python Fallback Pathing**: Fixed an issue where the Python SQLite fallback would fail if the IDE directory contained spaces (e.g., `Antigravity IDE`). Used `execFile` with piped standard input to securely execute queries.
+- **New IDE Chat DOM Locator**: Updated `ui_locators.js` to correctly locate the active chat container (`.relative.flex.flex-col.gap-y-3.px-4`) in the newer VS Code-based Antigravity IDE, preventing `/latest` from incorrectly reporting "Active chat not found".## [3.5.5] - 2026-06-27
 
 ### Fixed
 - **CDP Connection Failed — No Longer Requires PC Restart**: Fixed a persistent issue where the bot would report "CDP connection failed" after the IDE was closed or crashed. The root cause was stale Electron `SingletonLock` files left behind in the IDE's data directory, preventing the next instance from properly initializing its debugging port. Both `killIDE()` and `cleanLockFile()` in `platform.js` now automatically clean up `SingletonLock`, `SingletonCookie`, and `SingletonSocket` files.

@@ -68,3 +68,7 @@ scratch/
 *.heapsnapshot
 
 models/
+start_everything.bat
+AGENT.md
+# AI-agent local findings/data
+.ide_data/

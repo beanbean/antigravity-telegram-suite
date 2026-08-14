@@ -20,6 +20,10 @@
 
 ---
 
+## 📢 社区
+- **更新频道:** [@agts_updates](https://t.me/agts_updates)
+- **讨论组:** [@agts_community](https://t.me/agts_community)
+
 ## ✨ 功能
 
 | 功能 | 描述 |
@@ -51,6 +55,7 @@
 
 ### 前提条件
 
+- **双引擎支持 (IDE & Standalone):** 通过 `/app` 命令在 Classic Monaco IDE 和 Standalone Agent 之间无缝切换。隔离的驱动程序架构确保零冲突，并在切换时实现完美的后台进程管理。
 - [Node.js](https://nodejs.org/) >= 18
 - 已安装 [Antigravity IDE](https://antigravity.google/) 和/或 [Antigravity Standalone App](https://antigravity.google/)
 - 一个 Telegram Bot Token（从 [@BotFather](https://t.me/BotFather) 获取）
@@ -338,7 +343,7 @@ Bot 支持**两个 Antigravity 应用**同时运行：
 2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
 3. 提交更改 (`git commit -m 'Add amazing feature'`)
 4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 打开 Pull Request
+5. 针对 [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite) 打开 Pull Request
 
 ---
 
